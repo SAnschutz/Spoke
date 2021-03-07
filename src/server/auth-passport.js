@@ -1,10 +1,14 @@
 import passport from "passport";
 import Auth0Strategy from "passport-auth0";
 import { Strategy as LocalStrategy } from "passport-local";
+import slack from "@aoberoi/passport-slack";
 import { User, cacheableData } from "./models";
 import localAuthHelpers from "./local-auth-helpers";
 import wrap from "./wrap";
 import { capitalizeWord } from "./api/lib/utils";
+
+export const nextUrlRedirect = (nextUrl, defaultPath) =>
+  nextUrl && !nextUrl.startsWith("http") ? nextUrl : defaultPath || "/";
 
 export function setupAuth0Passport() {
   const strategy = new Auth0Strategy(
@@ -64,11 +68,17 @@ export function setupAuth0Passport() {
             email: req.user._json.email,
             is_superadmin: false
           };
-          await User.save(userData);
-          res.redirect(req.query.state || "terms");
+          const finalUser = await User.save(userData);
+          if (finalUser && finalUser.id === 1) {
+            await r
+              .knex("user")
+              .where("id", 1)
+              .update({ is_superadmin: true });
+          }
+          res.redirect(nextUrlRedirect(req.query.state, "terms"));
           return;
         }
-        res.redirect(req.query.state || "/");
+        res.redirect(nextUrlRedirect(req.query.state));
         return;
       })
     ]
@@ -115,10 +125,9 @@ export function setupLocalAuthPassport() {
 
   passport.deserializeUser(
     wrap(async (id, done) => {
-      const user = await cacheableData.user.userLoggedIn(
-        "id",
-        parseInt(id, 10)
-      );
+      const userId = parseInt(id, 10);
+      const user =
+        userId && (await cacheableData.user.userLoggedIn("id", userId));
       done(null, user || false);
     })
   );
@@ -127,13 +136,132 @@ export function setupLocalAuthPassport() {
     loginCallback: [
       passport.authenticate("local"),
       (req, res) => {
-        res.redirect(req.body.nextUrl || "/");
+        res.redirect(nextUrlRedirect(req.body.nextUrl));
       }
+    ]
+  };
+}
+
+function slackLoginId(teamId, userId) {
+  return ["slack", teamId, userId].join("|");
+}
+
+export function setupSlackPassport(app) {
+  passport.use(
+    new slack.Strategy(
+      {
+        clientID: process.env.SLACK_CLIENT_ID,
+        clientSecret: process.env.SLACK_CLIENT_SECRET,
+        callbackURL: `${process.env.BASE_URL}/login-callback`,
+        authorizationURL: process.env.SLACK_TEAM_NAME
+          ? `https://${process.env.SLACK_TEAM_NAME}.slack.com/oauth/authorize`
+          : undefined
+      },
+      function(
+        accessToken,
+        scopes,
+        team,
+        { bot, incomingWebhook },
+        { user: userProfile, team: teamProfile },
+        done
+      ) {
+        done(null, {
+          ...userProfile,
+          team: teamProfile
+        });
+      }
+    )
+  );
+
+  passport.serializeUser((user, done) => {
+    done(null, slackLoginId(user.team.id, user.id));
+  });
+
+  passport.deserializeUser(
+    wrap(async (id, done) => {
+      if (typeof id !== "string") {
+        // probably switched from password auth to slack auth
+        console.error(`Got non-string ID in slack passport deserialize: ${id}`);
+        done(null, false);
+        return;
+      }
+
+      const [loginType, teamId, userId] = id.split("|");
+
+      if (loginType !== "slack") {
+        console.error(`Invalid loginType in session token: ${loginType}`);
+        done(null, false);
+        return;
+      }
+
+      if (teamId !== process.env.SLACK_TEAM_ID) {
+        console.error(`Invalid team ID in session token: ${teamId}`);
+        done(null, false);
+        return;
+      }
+
+      const user = await cacheableData.user.userLoggedIn(
+        "auth0_id",
+        slackLoginId(teamId, userId)
+      );
+      done(null, user || false);
+    })
+  );
+
+  app.get("/login/slack-redirect", (req, res) => {
+    passport.authenticate("slack", {
+      scope: ["identity.basic", "identity.email", "identity.team"],
+      team: process.env.SLACK_TEAM_ID,
+      state: req.query.nextUrl
+    })(req, res);
+  });
+
+  return {
+    loginCallback: [
+      passport.authenticate("slack", { failureRedirect: "/login" }),
+      wrap(async (req, res) => {
+        const slackUser = req.user;
+
+        if (slackUser.team.id !== process.env.SLACK_TEAM_ID) {
+          res.send("Logged in using the wrong slack team");
+          return;
+        }
+
+        const loginId = slackLoginId(slackUser.team.id, slackUser.id);
+        const existingUser = await User.filter({ auth0_id: loginId });
+
+        if (existingUser.length > 0) {
+          // user already exists
+          res.redirect(nextUrlRedirect(req.query.state));
+          return;
+        }
+
+        const userData = {
+          auth0_id: loginId,
+          first_name: slackUser.name.split(" ")[0],
+          last_name: slackUser.name
+            .split(" ")
+            .slice(1)
+            .join(" "),
+          cell: "",
+          email: slackUser.email,
+          is_superadmin: false
+        };
+        const finalUser = await User.save(userData);
+        if (finalUser && finalUser.id === 1) {
+          await r
+            .knex("user")
+            .where("id", 1)
+            .update({ is_superadmin: true });
+        }
+        res.redirect(nextUrlRedirect(req.query.state)); // TODO: terms?
+      })
     ]
   };
 }
 
 export default {
   local: setupLocalAuthPassport,
-  auth0: setupAuth0Passport
+  auth0: setupAuth0Passport,
+  slack: setupSlackPassport
 };

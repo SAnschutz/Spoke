@@ -13,7 +13,7 @@ const styles = StyleSheet.create({
     ...theme.layouts.multiColumn.container
   },
   sidebar: {
-    minHeight: "calc(100vh - 56px)"
+    minHeight: "calc(100vh - 65px)"
   },
   content: {
     ...theme.layouts.multiColumn.flexColumn,
@@ -66,8 +66,9 @@ class AdminDashboard extends React.Component {
 
     // HACK: Setting params.adminPerms helps us hide non-supervolunteer functionality
     params.adminPerms = hasRole("ADMIN", roles || []);
+    params.ownerPerms = hasRole("OWNER", roles || []);
 
-    const sections = [
+    let sections = [
       {
         name: "Campaigns",
         path: "campaigns",
@@ -79,21 +80,30 @@ class AdminDashboard extends React.Component {
         role: "ADMIN"
       },
       {
-        name: "Optouts",
-        path: "optouts",
-        role: "ADMIN"
-      },
-      {
         name: "Message Review",
         path: "incoming",
+        role: "SUPERVOLUNTEER"
+      },
+      {
+        name: "Tags",
+        path: "tags",
         role: "SUPERVOLUNTEER"
       },
       {
         name: "Settings",
         path: "settings",
         role: "SUPERVOLUNTEER"
+      },
+      {
+        name: "Phone Numbers",
+        path: "phone-numbers",
+        role: "ADMIN"
       }
     ];
+
+    if (!this.props.data.organization.phoneInventoryEnabled) {
+      sections = sections.filter(section => section.name !== "Phone Numbers");
+    }
 
     let currentSection = sections.filter(section =>
       location.pathname.match(`/${section.path}`)
@@ -130,7 +140,7 @@ AdminDashboard.propTypes = {
   location: PropTypes.object
 };
 
-const mapQueriesToProps = ({ ownProps }) => ({
+const queries = {
   data: {
     query: gql`
       query getCurrentUserRoles($organizationId: String!) {
@@ -138,12 +148,18 @@ const mapQueriesToProps = ({ ownProps }) => ({
           id
           roles(organizationId: $organizationId)
         }
+        organization(id: $organizationId) {
+          name
+          phoneInventoryEnabled
+        }
       }
     `,
-    variables: {
-      organizationId: ownProps.params.organizationId
-    }
+    options: ownProps => ({
+      variables: {
+        organizationId: ownProps.params.organizationId
+      }
+    })
   }
-});
+};
 
-export default loadData(withRouter(AdminDashboard), { mapQueriesToProps });
+export default loadData({ queries })(withRouter(AdminDashboard));

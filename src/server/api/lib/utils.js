@@ -1,5 +1,14 @@
 import humps from "humps";
 
+export function mapFieldsOrNull(fields) {
+  const resolvers = {};
+
+  fields.forEach(field => {
+    resolvers[field] = o => o[field] || null;
+  });
+  return resolvers;
+}
+
 export function mapFieldsToModel(fields, model) {
   const resolvers = {};
 
@@ -7,7 +16,13 @@ export function mapFieldsToModel(fields, model) {
     const snakeKey = humps.decamelize(field, { separator: "_" });
     // eslint-disable-next-line no-underscore-dangle
     if (model._schema._schema.hasOwnProperty(snakeKey)) {
-      resolvers[field] = instance => instance[snakeKey];
+      if (/At$/.test(field)) {
+        // force a Date-type: esp. important for sqlite
+        resolvers[field] = instance =>
+          instance[snakeKey] ? new Date(instance[snakeKey]) : null;
+      } else {
+        resolvers[field] = instance => instance[snakeKey];
+      }
     } else {
       // eslint-disable-next-line no-underscore-dangle
       throw new Error(
@@ -23,4 +38,21 @@ export const capitalizeWord = word => {
     return word[0].toUpperCase() + word.slice(1);
   }
   return "";
+};
+
+export const groupCannedResponses = cannedResponses => {
+  const grouped = [];
+  let current = null;
+  cannedResponses.forEach(result => {
+    const res = { ...result };
+    if (!current || res.id !== current.id) {
+      res.tagIds = [];
+      grouped.push(res);
+      current = res;
+    }
+    if (res.tag_id) {
+      current.tagIds.push(res.tag_id);
+    }
+  });
+  return grouped;
 };

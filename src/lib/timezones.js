@@ -5,8 +5,9 @@ import {
   getProcessEnvDstReferenceTimezone
 } from "../lib/tz-helpers";
 import { DstHelper } from "./dst-helper";
+import { getConfig } from "../server/api/lib/config";
 
-const TIMEZONE_CONFIG = {
+const TIMEZONE_US_FALLBACK_WINDOW = {
   missingTimeZone: {
     offset: -5, // EST
     hasDST: true,
@@ -16,26 +17,28 @@ const TIMEZONE_CONFIG = {
 };
 
 export const getContactTimezone = (campaign, location) => {
-  const returnLocation = Object.assign({}, location);
-  if (location.timezone == null || location.timezone.offset == null) {
-    let timezoneData = null;
+  if (location) {
+    const returnLocation = Object.assign({}, location);
+    if (location.timezone == null || location.timezone.offset == null) {
+      let timezoneData = null;
 
-    if (campaign.overrideOrganizationTextingHours) {
-      const offset = DstHelper.getTimezoneOffsetHours(campaign.timezone);
-      const hasDST = DstHelper.timezoneHasDst(campaign.timezone);
-      timezoneData = { offset, hasDST };
-    } else if (getProcessEnvTz()) {
-      const offset = DstHelper.getTimezoneOffsetHours(getProcessEnvTz());
-      const hasDST = DstHelper.timezoneHasDst(getProcessEnvTz());
-      timezoneData = { offset, hasDST };
-    } else {
-      const offset = TIMEZONE_CONFIG.missingTimeZone.offset;
-      const hasDST = TIMEZONE_CONFIG.missingTimeZone.hasDST;
-      timezoneData = { offset, hasDST };
+      if (campaign.overrideOrganizationTextingHours) {
+        const offset = DstHelper.getTimezoneOffsetHours(campaign.timezone);
+        const hasDST = DstHelper.timezoneHasDst(campaign.timezone);
+        timezoneData = { offset, hasDST };
+      } else if (getProcessEnvTz()) {
+        const offset = DstHelper.getTimezoneOffsetHours(getProcessEnvTz());
+        const hasDST = DstHelper.timezoneHasDst(getProcessEnvTz());
+        timezoneData = { offset, hasDST };
+      } else {
+        const offset = TIMEZONE_US_FALLBACK_WINDOW.missingTimeZone.offset;
+        const hasDST = TIMEZONE_US_FALLBACK_WINDOW.missingTimeZone.hasDST;
+        timezoneData = { offset, hasDST };
+      }
+      returnLocation.timezone = timezoneData;
     }
-    returnLocation.timezone = timezoneData;
+    return returnLocation;
   }
-  return returnLocation;
 };
 
 export const getUtcFromOffsetAndHour = (
@@ -91,13 +94,9 @@ export const getSendBeforeTimeUtc = (
     return null;
   }
 
-  if (getProcessEnvTz()) {
-    return getUtcFromTimezoneAndHour(
-      getProcessEnvTz(),
-      organization.textingHoursEnd
-    );
-  }
-
+  const defaultTimezone = getProcessEnvTz(
+    getConfig("DEFAULT_TZ", organization)
+  );
   if (contactTimezone && contactTimezone.offset) {
     return getUtcFromOffsetAndHour(
       contactTimezone.offset,
@@ -105,10 +104,15 @@ export const getSendBeforeTimeUtc = (
       organization.textingHoursEnd,
       getProcessEnvDstReferenceTimezone()
     );
+  } else if (defaultTimezone) {
+    return getUtcFromTimezoneAndHour(
+      defaultTimezone,
+      organization.textingHoursEnd
+    );
   } else {
     return getUtcFromOffsetAndHour(
-      TIMEZONE_CONFIG.missingTimeZone.offset,
-      TIMEZONE_CONFIG.missingTimeZone.hasDST,
+      TIMEZONE_US_FALLBACK_WINDOW.missingTimeZone.offset,
+      TIMEZONE_US_FALLBACK_WINDOW.missingTimeZone.hasDST,
       organization.textingHoursEnd,
       getProcessEnvDstReferenceTimezone()
     );
@@ -158,6 +162,7 @@ export const isBetweenTextingHours = (offsetData, config) => {
       return true;
     }
   } else if (!config.textingHoursEnforced) {
+    // organization setting
     return true;
   }
 
@@ -179,22 +184,23 @@ export const isBetweenTextingHours = (offsetData, config) => {
     );
   }
 
-  if (getProcessEnvTz()) {
-    const today = moment.tz(getProcessEnvTz()).format("YYYY-MM-DD");
+  const localTimezone = getProcessEnvTz(config.defaultTimezone);
+  if (!offsetData && localTimezone) {
+    const today = moment.tz(localTimezone).format("YYYY-MM-DD");
     const start = moment
-      .tz(`${today}`, getProcessEnvTz())
+      .tz(`${today}`, localTimezone)
       .add(config.textingHoursStart, "hours");
     const stop = moment
-      .tz(`${today}`, getProcessEnvTz())
+      .tz(`${today}`, localTimezone)
       .add(config.textingHoursEnd, "hours");
-    return moment.tz(getProcessEnvTz()).isBetween(start, stop, null, "[]");
+    return moment.tz(localTimezone).isBetween(start, stop, null, "[]");
   }
 
   return isOffsetBetweenTextingHours(
     offsetData,
     config.textingHoursStart,
     config.textingHoursEnd,
-    TIMEZONE_CONFIG.missingTimeZone,
+    TIMEZONE_US_FALLBACK_WINDOW.missingTimeZone,
     getProcessEnvDstReferenceTimezone()
   );
 };

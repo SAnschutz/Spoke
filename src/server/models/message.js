@@ -8,7 +8,7 @@ import {
 } from "./custom-types";
 
 import User from "./user";
-import Assignment from "./assignment";
+import CampaignContact from "./campaign-contact";
 
 const Message = thinky.createModel(
   "message",
@@ -29,10 +29,10 @@ const Message = thinky.createModel(
         .required()
         .allowNull(false),
       text: optionalString(),
-      // for errors,etc returned back by the service
-      // will be several json strings appended together, so JSON.parse will NOT work
-      service_response: optionalString(),
-      assignment_id: requiredString(),
+      media: type.string().default(null),
+      assignment_id: optionalString(), //deprecated: use refs by campaign_contact_id or user_id
+      campaign_contact_id: optionalString(),
+      messageservice_sid: optionalString().stopReference(),
       service: optionalString(),
       service_id: optionalString().stopReference(),
       send_status: requiredString().enum(
@@ -44,6 +44,10 @@ const Message = thinky.createModel(
         "PAUSED",
         "NOT_ATTEMPTED"
       ),
+      error_code: type
+        .integer()
+        .allowNull()
+        .default(null),
       created_at: timestamp(),
       queued_at: timestamp(),
       sent_at: timestamp(),
@@ -51,14 +55,18 @@ const Message = thinky.createModel(
       send_before: optionalTimestamp()
     })
     .allowExtra(false),
-  { noAutoCreation: true, dependencies: [User, Assignment] }
+  { noAutoCreation: true, dependencies: [User, CampaignContact] }
 );
 
 Message.ensureIndex("user_id");
-Message.ensureIndex("assignment_id");
+//Message.ensureIndex("assignment_id");
+Message.ensureIndex("campaign_contact_id");
 Message.ensureIndex("send_status");
-Message.ensureIndex("user_number");
-Message.ensureIndex("contact_number");
+//Message.ensureIndex("contact_number");
 Message.ensureIndex("service_id");
+Message.ensureIndex("cell_messageservice_sid_idx", doc => [
+  doc("contact_number"),
+  doc("messageservice_sid")
+]);
 
 export default Message;

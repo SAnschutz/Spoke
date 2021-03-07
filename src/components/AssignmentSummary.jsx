@@ -2,16 +2,20 @@ import PropTypes from "prop-types";
 import React, { Component } from "react";
 import { Card, CardActions, CardTitle } from "material-ui/Card";
 import { StyleSheet, css } from "aphrodite";
-import loadData from "../containers/hoc/load-data";
-import gql from "graphql-tag";
+import { setContrastingColor } from "../lib/color-contrast-helper";
 import RaisedButton from "material-ui/RaisedButton";
 import Badge from "material-ui/Badge";
-import moment from "moment";
 import Divider from "material-ui/Divider";
 import { withRouter } from "react-router";
 import { dataTest } from "../lib/attributes";
+import AssignmentTexterFeedback from "../extensions/texter-sideboxes/texter-feedback/AssignmentTexterFeedback";
 
-const inlineStyles = {
+import {
+  getSideboxes,
+  renderSummary
+} from "../extensions/texter-sideboxes/components";
+
+export const inlineStyles = {
   badge: {
     fontSize: 12,
     top: 20,
@@ -53,8 +57,10 @@ export class AssignmentSummary extends Component {
   };
 
   goToTodos(contactsFilter, assignmentId) {
-    const { organizationId, router } = this.props;
-
+    const { organizationId, router, todoLink } = this.props;
+    if (todoLink) {
+      return todoLink(contactsFilter, assignmentId, router);
+    }
     if (contactsFilter) {
       router.push(
         `/app/${organizationId}/todos/${assignmentId}/${contactsFilter}`
@@ -107,33 +113,57 @@ export class AssignmentSummary extends Component {
   }
 
   render() {
+    const { assignment, texter } = this.props;
     const {
-      assignment,
+      campaign,
       unmessagedCount,
       unrepliedCount,
       badTimezoneCount,
-      totalMessagedCount,
       pastMessagesCount,
-      skippedMessagesCount
-    } = this.props;
+      skippedMessagesCount,
+      feedback
+    } = assignment;
     const {
+      id: campaignId,
       title,
       description,
-      hasUnassignedContactsForTexter,
-      dueBy,
       primaryColor,
       logoImageUrl,
       introHtml,
-      useDynamicAssignment
-    } = assignment.campaign;
-    const maxContacts = assignment.maxContacts;
+      texterUIConfig
+    } = campaign;
+    const settingsData = JSON.parse(
+      (texterUIConfig && texterUIConfig.options) || "{}"
+    );
+    const sideboxProps = { assignment, campaign, texter, settingsData };
+    const enabledSideboxes = getSideboxes(sideboxProps, "TexterTodoList");
+    // if there's a sidebox marked popup, then we will only show that sidebox and little else
+    const hasPopupSidebox = enabledSideboxes.popups.length;
+    const sideboxList = enabledSideboxes
+      .filter(sb =>
+        hasPopupSidebox ? sb.name === enabledSideboxes.popups[0] : true
+      )
+      .map(sb => renderSummary(sb, settingsData, this, sideboxProps));
+    const cardTitleTextColor = setContrastingColor(primaryColor);
+
+    // NOTE: we bring back archived campaigns if they have feedback
+    // but want to get rid of them once feedback is acknowledged
+    if (campaign.isArchived && !hasPopupSidebox) return null;
+
     return (
-      <div className={css(styles.container)}>
-        <Card key={assignment.id}>
+      <div
+        className={css(styles.container)}
+        {...dataTest(`assignmentSummary-${campaignId}`)}
+      >
+        <Card>
           <CardTitle
             title={title}
-            subtitle={`${description} - ${moment(dueBy).format("MMM D YYYY")}`}
-            style={{ backgroundColor: primaryColor }}
+            titleStyle={{ color: cardTitleTextColor }}
+            subtitle={description}
+            subtitleStyle={{ color: cardTitleTextColor }}
+            style={{
+              backgroundColor: primaryColor
+            }}
             children={
               logoImageUrl ? (
                 <img src={logoImageUrl} className={css(styles.image)} />
@@ -143,11 +173,15 @@ export class AssignmentSummary extends Component {
             }
           />
           <Divider />
-          <div style={{ margin: "20px" }}>
-            <div dangerouslySetInnerHTML={{ __html: introHtml }} />
-          </div>
+          {introHtml ? (
+            <div style={{ margin: "20px" }}>
+              <div dangerouslySetInnerHTML={{ __html: introHtml }} />
+            </div>
+          ) : null}
           <CardActions>
-            {window.NOT_IN_USA && window.ALLOW_SEND_ALL
+            {hasPopupSidebox && sideboxList}
+
+            {(window.NOT_IN_USA && window.ALLOW_SEND_ALL) || hasPopupSidebox
               ? ""
               : this.renderBadgedButton({
                   dataTestText: "sendFirstTexts",
@@ -155,20 +189,16 @@ export class AssignmentSummary extends Component {
                   title: "Send first texts",
                   count: unmessagedCount,
                   primary: true,
-                  disabled:
-                    (useDynamicAssignment &&
-                      !hasUnassignedContactsForTexter &&
-                      unmessagedCount == 0) ||
-                    (useDynamicAssignment && maxContacts === 0),
+                  disabled: false,
                   contactsFilter: "text",
-                  hideIfZero: !useDynamicAssignment
+                  hideIfZero: true
                 })}
-            {window.NOT_IN_USA && window.ALLOW_SEND_ALL
+            {(window.NOT_IN_USA && window.ALLOW_SEND_ALL) || hasPopupSidebox
               ? ""
               : this.renderBadgedButton({
-                  dataTestText: "sendReplies",
+                  dataTestText: "Respond",
                   assignment,
-                  title: "Send replies",
+                  title: "Respond",
                   count: unrepliedCount,
                   primary: false,
                   disabled: false,
@@ -195,7 +225,7 @@ export class AssignmentSummary extends Component {
               contactsFilter: "skipped",
               hideIfZero: true
             })}
-            {window.NOT_IN_USA && window.ALLOW_SEND_ALL
+            {window.NOT_IN_USA && window.ALLOW_SEND_ALL && !hasPopupSidebox
               ? this.renderBadgedButton({
                   assignment,
                   title: "Send messages",
@@ -208,14 +238,28 @@ export class AssignmentSummary extends Component {
               : ""}
             {this.renderBadgedButton({
               assignment,
-              title: "Send later",
+              title: "Send later (outside timezone)",
               count: badTimezoneCount,
               primary: false,
               disabled: true,
               contactsFilter: null,
               hideIfZero: true
             })}
+            {sideboxList.length && !hasPopupSidebox ? (
+              <div style={{ paddingLeft: "14px", paddingBottom: "10px" }}>
+                {sideboxList}
+              </div>
+            ) : null}
           </CardActions>
+          {!sideboxList.length &&
+          !unmessagedCount &&
+          !unrepliedCount &&
+          !pastMessagesCount &&
+          !skippedMessagesCount &&
+          !badTimezoneCount ? (
+            <div style={{ padding: "0 20px 20px 20px" }}>Nothing to do</div>
+          ) : null}
+          }
         </Card>
       </div>
     );
@@ -226,14 +270,9 @@ AssignmentSummary.propTypes = {
   organizationId: PropTypes.string,
   router: PropTypes.object,
   assignment: PropTypes.object,
-  unmessagedCount: PropTypes.number,
-  unrepliedCount: PropTypes.number,
-  badTimezoneCount: PropTypes.number,
-  totalMessagedCount: PropTypes.number,
-  pastMessagesCount: PropTypes.number,
-  skippedMessagesCount: PropTypes.number,
-  data: PropTypes.object,
-  mutations: PropTypes.object
+  texter: PropTypes.object,
+  refreshData: PropTypes.func,
+  todoLink: PropTypes.func
 };
 
 export default withRouter(AssignmentSummary);

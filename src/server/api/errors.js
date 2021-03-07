@@ -26,11 +26,21 @@ export async function accessRequired(
   // require a permission at-or-higher than the permission requested
   const hasRole = await cacheableData.user.userHasRole(user, orgId, role);
   if (!hasRole) {
-    throw new GraphQLError("You are not authorized to access that resource.");
+    const error = new GraphQLError(
+      "You are not authorized to access that resource."
+    );
+    error.code = "UNAUTHORIZED";
+    throw error;
   }
 }
 
-export async function assignmentRequired(user, assignmentId, assignment) {
+export async function assignmentRequiredOrAdminRole(
+  user,
+  orgId,
+  assignmentId,
+  contact,
+  assignment
+) {
   authRequired(user);
 
   if (user.is_superadmin) {
@@ -40,26 +50,33 @@ export async function assignmentRequired(user, assignmentId, assignment) {
     // if we are passed the full assignment object, we can test directly
     return true;
   }
-
-  const [userHasAssignment] = await r
-    .knex("assignment")
-    .where({
-      user_id: user.id,
-      id: assignmentId
-    })
-    .limit(1);
-
-  if (!userHasAssignment) {
-    // undefined or null
-    throw new GraphQLError("You are not authorized to access that resource.");
+  if (
+    contact &&
+    contact.user_id === user.id &&
+    contact.assignment_id === Number(assignmentId)
+  ) {
+    // cached contact data can have assignment_id and user_id
+    // check both to verify that the assignmentId-userId pair are accepted
+    return true;
   }
-  return true;
-}
 
-export function superAdminRequired(user) {
-  authRequired(user);
+  const userHasAssignment = await cacheableData.assignment.hasAssignment(
+    user.id,
+    assignmentId
+  );
 
-  if (!user.is_superadmin) {
-    throw new GraphQLError("You are not authorized to access that resource.");
+  const roleRequired = userHasAssignment ? "TEXTER" : "SUPERVOLUNTEER";
+  const hasPermission = await cacheableData.user.userHasRole(
+    user,
+    orgId,
+    roleRequired
+  );
+  if (!hasPermission) {
+    const error = new GraphQLError(
+      "You are not authorized to access that resource."
+    );
+    error.code = "UNAUTHORIZED";
+    throw error;
   }
+  return userHasAssignment || true;
 }

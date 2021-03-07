@@ -55,8 +55,7 @@ export default class CampaignTextingHoursForm extends React.Component {
     initialValue,
     label,
     hint,
-    choices,
-    collection
+    choices
   ) {
     return (
       <Form.Field
@@ -170,13 +169,12 @@ export default class CampaignTextingHoursForm extends React.Component {
           "Override organization texting hours?"
         )}
 
+        {this.addToggleFormField(
+          "textingHoursEnforced",
+          "Texting hours enforced?"
+        )}
         {this.props.formValues.overrideOrganizationTextingHours ? (
           <div>
-            {this.addToggleFormField(
-              "textingHoursEnforced",
-              "Texting hours enforced?"
-            )}
-
             {this.props.formValues.textingHoursEnforced ? (
               <div>
                 {this.addAutocompleteFormField(
@@ -198,16 +196,6 @@ export default class CampaignTextingHoursForm extends React.Component {
                   hourChoices,
                   hours
                 )}
-
-                {this.addAutocompleteFormField(
-                  "timezone",
-                  "timezoneSearchText",
-                  this.props.formValues.timezone,
-                  "Timezone to use for contacts without ZIP code and to determine daylight savings",
-                  "Start typing a timezone",
-                  timezoneChoices,
-                  timezones
-                )}
               </div>
             ) : (
               ""
@@ -215,6 +203,16 @@ export default class CampaignTextingHoursForm extends React.Component {
           </div>
         ) : (
           ""
+        )}
+
+        {this.addAutocompleteFormField(
+          "timezone",
+          "timezoneSearchText",
+          this.props.formValues.timezone,
+          "Timezone to use for contacts without ZIP code and to determine daylight savings",
+          "Start typing a timezone",
+          timezoneChoices,
+          timezones
         )}
 
         <Form.Button

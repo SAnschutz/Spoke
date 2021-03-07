@@ -2,12 +2,17 @@ import React, { Component } from "react";
 import type from "prop-types";
 import Toggle from "material-ui/Toggle";
 
+import _ from "lodash";
 import { Card, CardHeader, CardText } from "material-ui/Card";
 import AutoComplete from "material-ui/AutoComplete";
+import Checkbox from "material-ui/Checkbox";
 import SelectField from "material-ui/SelectField";
+import TextField from "material-ui/TextField";
 import MenuItem from "material-ui/MenuItem";
 import theme from "../styles/theme";
 import { dataSourceItem } from "./utils";
+import SelectedCampaigns from "./SelectedCampaigns";
+import TagsSelector from "./TagsSelector";
 
 import { StyleSheet, css } from "aphrodite";
 
@@ -54,6 +59,10 @@ export const MESSAGE_STATUSES = {
   closed: {
     name: "Closed",
     children: []
+  },
+  needsResponseExpired: {
+    name: "Expired Needs Response",
+    children: []
   }
 };
 
@@ -62,23 +71,37 @@ export const ALL_CAMPAIGNS = -1;
 export const CAMPAIGN_TYPE_FILTERS = [[ALL_CAMPAIGNS, "All Campaigns"]];
 
 export const ALL_TEXTERS = -1;
+export const UNASSIGNED = -2;
 
-export const TEXTER_FILTERS = [[ALL_TEXTERS, "All Texters"]];
+export const TEXTER_FILTERS = [
+  [ALL_TEXTERS, " All Texters"],
+  [UNASSIGNED, " Unassigned"]
+];
 
 class IncomingMessageFilter extends Component {
   constructor(props) {
     super(props);
 
-    this.state = {};
-
-    this.onMessageFilterSelectChanged = this.onMessageFilterSelectChanged.bind(
-      this
-    );
-    this.onTexterSelected = this.onTexterSelected.bind(this);
-    this.onCampaignSelected = this.onCampaignSelected.bind(this);
+    this.state = {
+      selectedCampaigns: [],
+      messageTextFilter: this.props.messageTextFilter,
+      messageFilter:
+        this.props.messageFilter && this.props.messageFilter.split(","),
+      tagsFilter: this.props.tagsFilter,
+      errorCode: this.props.errorCode
+    };
   }
 
-  onMessageFilterSelectChanged(event, index, values) {
+  componentWillUpdate = (nextProps, nextState) => {
+    if (nextProps.texterSearchText && !this.state.texterSearchText) {
+      this.state.texterSearchText = nextProps.texterSearchText;
+    }
+    if (nextProps.selectedCampaigns && !this.state.selectedCampaigns.length) {
+      this.state.selectedCampaigns = nextProps.selectedCampaigns;
+    }
+  };
+
+  onMessageFilterSelectChanged = (event, index, values) => {
     this.setState({ messageFilter: values });
     const messageStatuses = new Set();
     values.forEach(value => {
@@ -92,14 +115,14 @@ class IncomingMessageFilter extends Component {
 
     const messageStatusesString = Array.from(messageStatuses).join(",");
     this.props.onMessageFilterChanged(messageStatusesString);
-  }
+  };
 
-  onCampaignSelected(selection, index) {
+  onCampaignSelected = (selection, index) => {
     let campaignId = undefined;
     if (index === -1) {
-      const campaign = this.props.texters.find(campaign => {
-        return campaign.title === selection;
-      });
+      const campaign = this.props.campaigns.find(
+        cmpgn => cmpgn.title === selection
+      );
       if (campaign) {
         campaignId = campaign.id;
       }
@@ -107,11 +130,15 @@ class IncomingMessageFilter extends Component {
       campaignId = selection.value.key;
     }
     if (campaignId) {
-      this.props.onCampaignChanged(parseInt(campaignId, 10));
+      const selectedCampaigns = this.makeSelectedCampaignsArray(
+        selection.rawValue,
+        selection.text
+      );
+      this.applySelectedCampaigns(selectedCampaigns);
     }
-  }
+  };
 
-  onTexterSelected(selection, index) {
+  onTexterSelected = (selection, index) => {
     let texterUserId = undefined;
     if (index === -1) {
       const texter = this.props.texters.find(texter => {
@@ -126,7 +153,64 @@ class IncomingMessageFilter extends Component {
     if (texterUserId) {
       this.props.onTexterChanged(parseInt(texterUserId, 10));
     }
-  }
+  };
+
+  onTagsFilterChanged = tagsFilter => {
+    this.setState({ tagsFilter });
+    this.props.onTagsFilterChanged(tagsFilter);
+  };
+
+  applySelectedCampaigns = selectedCampaigns => {
+    this.setState({
+      selectedCampaigns,
+      campaignSearchText: ""
+    });
+
+    this.fireCampaignChanged(selectedCampaigns);
+  };
+
+  handleCampaignRemoved = campaignId => {
+    const selectedCampaigns = this.state.selectedCampaigns.filter(
+      campaign => campaign.key !== campaignId
+    );
+    this.applySelectedCampaigns(selectedCampaigns);
+  };
+
+  handleClearCampaigns = () => {
+    this.applySelectedCampaigns([]);
+  };
+
+  fireCampaignChanged = selectedCampaigns => {
+    this.props.onCampaignChanged(
+      this.selectedCampaignIds(selectedCampaigns),
+      selectedCampaigns
+    );
+  };
+
+  removeAllCampaignsFromCampaignsArray = campaign =>
+    campaign.key !== ALL_CAMPAIGNS;
+
+  makeSelectedCampaignsArray = (campaignId, campaignText) => {
+    const selectedCampaign = { key: campaignId, text: campaignText };
+    if (campaignId === ALL_CAMPAIGNS) {
+      return [];
+    }
+    return _.concat(
+      this.state.selectedCampaigns.filter(
+        this.removeAllCampaignsFromCampaignsArray
+      ),
+      selectedCampaign
+    );
+  };
+
+  selectedCampaignIds = selectedCampaigns =>
+    selectedCampaigns.map(campaign => parseInt(campaign.key, 10));
+
+  campaignsNotAlreadySelected = campaign => {
+    return !this.selectedCampaignIds(this.state.selectedCampaigns).includes(
+      parseInt(campaign.id, 10)
+    );
+  };
 
   render() {
     const texterNodes = TEXTER_FILTERS.map(texterFilter =>
@@ -148,15 +232,19 @@ class IncomingMessageFilter extends Component {
     ).concat(
       !this.props.campaigns
         ? []
-        : this.props.campaigns.map(campaign => {
-            const campaignId = parseInt(campaign.id, 10);
-            const campaignDisplay = `${campaignId}: ${campaign.title}`;
-            return dataSourceItem(campaignDisplay, campaignId);
-          })
+        : this.props.campaigns
+            .filter(this.campaignsNotAlreadySelected)
+            .map(campaign => {
+              const campaignId = parseInt(campaign.id, 10);
+              const campaignDisplay = `${campaignId}: ${campaign.title}`;
+              return dataSourceItem(campaignDisplay, campaignId);
+            })
     );
     campaignNodes.sort((left, right) => {
       return left.text.localeCompare(right.text, "en", { sensitivity: "base" });
     });
+
+    //this.state.texterSearchText = this.props.texterSearchText;
 
     return (
       <Card>
@@ -194,6 +282,14 @@ class IncomingMessageFilter extends Component {
                 label={"Opted Out"}
                 onToggle={this.props.onOptedOutConversationsToggled}
                 toggled={this.props.includeOptedOutConversations}
+              />
+            </div>
+            <div className={css(styles.spacer)} />
+            <div className={css(styles.toggleFlexColumn)}>
+              <SelectedCampaigns
+                campaigns={this.state.selectedCampaigns}
+                onDeleteRequested={this.handleCampaignRemoved}
+                onClear={this.handleClearCampaigns}
               />
             </div>
           </div>
@@ -237,7 +333,7 @@ class IncomingMessageFilter extends Component {
                 searchText={this.state.campaignSearchText}
                 dataSource={campaignNodes}
                 hintText={"Search for a campaign"}
-                floatingLabelText={"Campaign"}
+                floatingLabelText={"Select a campaign"}
                 onNewRequest={this.onCampaignSelected}
               />
             </div>
@@ -256,6 +352,55 @@ class IncomingMessageFilter extends Component {
                 floatingLabelText={"Texter"}
                 onNewRequest={this.onTexterSelected}
               />
+              <div>
+                <Checkbox
+                  checked={this.props.assignmentsFilter.sender}
+                  onCheck={this.props.onTexterChanged}
+                />
+                search senders (instead of assignments)
+              </div>
+            </div>
+            <div className={css(styles.spacer)} />
+            <div className={css(styles.flexColumn)}>
+              <TextField
+                hintText="Search message text"
+                floatingLabelText="Search message text"
+                value={this.state.messageTextFilter}
+                onChange={(_, messageTextFilter) => {
+                  this.setState({ messageTextFilter });
+                }}
+                onKeyPress={evt => {
+                  if (evt.key === "Enter") {
+                    this.props.onMessageTextFilterChanged(
+                      this.state.messageTextFilter
+                    );
+                  }
+                }}
+              />
+            </div>
+            <div className={css(styles.spacer)} />
+            <div className={css(styles.flexColumn)}>
+              <TagsSelector
+                onChange={this.onTagsFilterChanged}
+                tagsFilter={this.state.tagsFilter}
+                tags={this.props.tags}
+              />
+            </div>
+            <div className={css(styles.spacer)} />
+            <div className={css(styles.flexColumn)}>
+              <TextField
+                hintText="Error code number"
+                floatingLabelText="Error codes"
+                value={this.state.errorCode}
+                onChange={(_, errorCode) => {
+                  this.setState({ errorCode });
+                }}
+                onKeyPress={evt => {
+                  if (evt.key === "Enter") {
+                    this.props.onErrorCodeChanged(this.state.errorCode);
+                  }
+                }}
+              />
             </div>
           </div>
         </CardText>
@@ -267,6 +412,8 @@ class IncomingMessageFilter extends Component {
 IncomingMessageFilter.propTypes = {
   onCampaignChanged: type.func.isRequired,
   onTexterChanged: type.func.isRequired,
+  onMessageTextFilterChanged: type.func.isRequired,
+  onErrorCodeChanged: type.func.isRequired,
   onActiveCampaignsToggled: type.func.isRequired,
   onArchivedCampaignsToggled: type.func.isRequired,
   includeArchivedCampaigns: type.bool.isRequired,
@@ -279,8 +426,16 @@ IncomingMessageFilter.propTypes = {
   texters: type.array.isRequired,
   onMessageFilterChanged: type.func.isRequired,
   assignmentsFilter: type.shape({
-    texterId: type.number
-  }).isRequired
+    texterId: type.number,
+    sender: type.bool
+  }).isRequired,
+  onTagsFilterChanged: type.func.isRequired,
+  tags: type.arrayOf(type.object).isRequired,
+  tagsFilter: type.object.isRequired,
+  messageTextFilter: type.string,
+  texterSearchText: type.string,
+  errorCode: type.arrayOf(type.number),
+  selectedCampaigns: type.array
 };
 
 export default IncomingMessageFilter;

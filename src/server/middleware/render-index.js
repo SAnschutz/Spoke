@@ -1,3 +1,8 @@
+import { hasConfig, getConfig } from "../api/lib/config";
+import { getProcessEnvTz, getProcessEnvDstReferenceTimezone } from "../../lib";
+
+const canGoogleImport = hasConfig("GOOGLE_SECRET");
+
 const rollbarScript = process.env.ROLLBAR_CLIENT_TOKEN
   ? `<script>
     var _rollbarConfig = {
@@ -27,7 +32,7 @@ const externalLinks = process.env.NO_EXTERNAL_LINKS
   ? ""
   : '<link rel="stylesheet" type="text/css" href="https://fonts.googleapis.com/css?family=Poppins">';
 
-export default function renderIndex(html, css, assetMap, store) {
+export default function renderIndex(html, css, assetMap) {
   return `
 <!DOCTYPE html>
 <html lang="en">
@@ -61,23 +66,59 @@ export default function renderIndex(html, css, assetMap, store) {
   <body>
     <div id="mount">${html}</div>
     <script>
-      window.INITIAL_STATE=${JSON.stringify(store.getState())}
       window.RENDERED_CLASS_NAMES=${JSON.stringify(css.renderedClassNames)}
       window.AUTH0_CLIENT_ID="${process.env.AUTH0_CLIENT_ID}"
       window.AUTH0_DOMAIN="${process.env.AUTH0_DOMAIN}"
-      window.SUPPRESS_SELF_INVITE="${process.env.SUPPRESS_SELF_INVITE || ""}"
+      window.SUPPRESS_SELF_INVITE=${getConfig("SUPPRESS_SELF_INVITE", null, {
+        truthy: true
+      })}
       window.NODE_ENV="${process.env.NODE_ENV}"
       window.PRIVACY_URL="${process.env.PRIVACY_URL || ""}"
       window.BASE_URL="${process.env.BASE_URL || ""}"
       window.NOT_IN_USA=${process.env.NOT_IN_USA || 0}
-      window.ALLOW_SEND_ALL=${process.env.ALLOW_SEND_ALL || 0}
+      window.ALLOW_SEND_ALL=${getConfig("ALLOW_SEND_ALL", null, {
+        truthy: 1
+      }) || false}
       window.BULK_SEND_CHUNK_SIZE=${process.env.BULK_SEND_CHUNK_SIZE || 0}
       window.MAX_MESSAGE_LENGTH=${process.env.MAX_MESSAGE_LENGTH || 99999}
-      window.TERMS_REQUIRE="${process.env.TERMS_REQUIRE || ""}"
-      window.TZ="${process.env.TZ || ""}"
-      window.DST_REFERENCE_TIMEZONE="${process.env.DST_REFERENCE_TIMEZONE ||
-        "America/New_York"}"
-      window.PASSPORT_STRATEGY="${process.env.PASSPORT_STRATEGY || ""}"
+      window.TERMS_REQUIRE=${getConfig("TERMS_REQUIRE", null, {
+        truthy: 1
+      }) || false}
+      window.TZ="${getProcessEnvTz() || ""}"
+      window.CONTACT_LOADERS="${process.env.CONTACT_LOADERS ||
+        "csv-upload,test-fakedata,datawarehouse"}"
+      window.DST_REFERENCE_TIMEZONE="${getProcessEnvDstReferenceTimezone() ||
+        "US/Eastern"}"
+      window.PASSPORT_STRATEGY="${process.env.PASSPORT_STRATEGY || "auth0"}"
+      window.PEOPLE_PAGE_CAMPAIGN_FILTER_SORT = "${process.env
+        .PEOPLE_PAGE_CAMPAIGN_FILTER_SORT || ""}"
+      window.PEOPLE_PAGE_ROW_SIZES="${process.env.PEOPLE_PAGE_ROW_SIZES || ""}"
+      window.CONVERSATION_LIST_ROW_SIZES="${process.env
+        .CONVERSATION_LIST_ROW_SIZES || ""}"
+      window.CORE_BACKGROUND_COLOR="${process.env.CORE_BACKGROUND_COLOR || ""}"
+      window.CAN_GOOGLE_IMPORT=${canGoogleImport}
+      window.DOWNTIME="${process.env.DOWNTIME || ""}"
+      window.DOWNTIME_TEXTER="${process.env.DOWNTIME_TEXTER || ""}"
+      window.EXPERIMENTAL_TWILIO_PER_CAMPAIGN_MESSAGING_SERVICE=${process.env
+        .EXPERIMENTAL_TWILIO_PER_CAMPAIGN_MESSAGING_SERVICE || false}
+      window.TWILIO_MULTI_ORG=${process.env.TWILIO_MULTI_ORG || false}
+      window.DEPRECATED_TEXTERUI="${process.env.DEPRECATED_TEXTERUI || ""}"
+      ${
+        process.env.TEXTER_SIDEBOXES
+          ? 'window.TEXTER_SIDEBOXES="' + process.env.TEXTER_SIDEBOXES + '"'
+          : ""
+      }
+      window.TEXTER_TWOCLICK=${getConfig("TEXTER_TWOCLICK", null, {
+        truthy: 1
+      }) || false}
+      window.MAX_NUMBERS_PER_BUY_JOB=${getConfig("MAX_NUMBERS_PER_BUY_JOB") ||
+        100};
+      window.CONTACTS_PER_PHONE_NUMBER=${getConfig(
+        "CONTACTS_PER_PHONE_NUMBER"
+      ) || 200};      
+      window.MOBILIZE_EVENT_SHIFTER_URL='${getConfig(
+        "MOBILIZE_EVENT_SHIFTER_URL"
+      )}';
     </script>
     <script src="${assetMap["bundle.js"]}"></script>
   </body>

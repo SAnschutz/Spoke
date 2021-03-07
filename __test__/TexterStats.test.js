@@ -10,7 +10,8 @@ const campaign = {
       texter: {
         id: "1",
         firstName: "Test",
-        lastName: "Tester"
+        lastName: "Tester",
+        roles: ["SUSPENDED", "TEXTER"]
       },
       unmessagedCount: 193,
       contactsCount: 238
@@ -20,7 +21,8 @@ const campaign = {
       texter: {
         id: "1",
         firstName: "Someone",
-        lastName: "Else"
+        lastName: "Else",
+        roles: ["SUSPENDED"]
       },
       unmessagedCount: 4,
       contactsCount: 545
@@ -36,7 +38,8 @@ const campaignDynamic = {
       texter: {
         id: "1",
         firstName: "Test",
-        lastName: "Tester"
+        lastName: "Tester",
+        roles: ["SUSPENDED", "TEXTER"]
       },
       unmessagedCount: 193,
       contactsCount: 238
@@ -46,7 +49,8 @@ const campaignDynamic = {
       texter: {
         id: "1",
         firstName: "Someone",
-        lastName: "Else"
+        lastName: "Else",
+        roles: ["SUSPENDED"]
       },
       unmessagedCount: 4,
       contactsCount: 545
@@ -56,9 +60,11 @@ const campaignDynamic = {
 
 describe("TexterStats (Non-dynamic campaign)", () => {
   it("contains the right text", () => {
-    const stats = shallow(<TexterStats campaign={campaign} />);
+    const stats = shallow(
+      <TexterStats campaign={campaign} organizationId="1" />
+    );
     expect(stats.text()).toEqual(
-      "Test Tester19%<LinearProgress />Someone Else99%<LinearProgress />"
+      "Test Tester <Link />19%<LinearProgress /><Link />  |  <Link />  |  <Link />Someone Else (Suspended) <Link />99%<LinearProgress /><Link />  |  <Link />  |  <Link />"
     );
   });
 
@@ -80,7 +86,7 @@ describe("TexterStats (Dynamic campaign)", () => {
   it("contains the right text", () => {
     const stats = shallow(<TexterStats campaign={campaignDynamic} />);
     expect(stats.text()).toEqual(
-      "Test45 initial messages sentSomeone541 initial messages sent"
+      "Test Tester <Link />45 initial messages sent. <Link />  |  <Link />  |  <Link />Someone Else (Suspended) <Link />541 initial messages sent. <Link />  |  <Link />  |  <Link />"
     );
   });
 });

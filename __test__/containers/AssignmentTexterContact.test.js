@@ -24,10 +24,14 @@ const campaign = {
     id: 2,
     textingHoursEnforced: true,
     textingHoursStart: 8,
-    textingHoursEnd: 21,
-    threeClickEnabled: false
+    textingHoursEnd: 21
   },
   customFields: [],
+  texterUIConfig: {
+    sideboxChoices: [],
+    options: "{}"
+  },
+  cannedResponses: [],
   interactionSteps: [
     {
       id: 11,
@@ -46,18 +50,16 @@ const propsWithEnforcedTextingHoursCampaign = {
     lastName: "person",
     assignedCell: null
   },
-  campaign: campaign,
+  campaign,
   assignment: {
     id: 9,
-    userCannedResponses: [],
-    campaignCannedResponses: [],
     texter: {
       id: 2,
       firstName: "larry",
       lastName: "person",
       assignedCell: null
     },
-    campaign: campaign,
+    campaign,
     contacts: [
       {
         id: 19
@@ -90,7 +92,15 @@ const propsWithEnforcedTextingHoursCampaign = {
     },
     messageStatus: "needsMessage",
     messages: []
-  }
+  },
+  navigationToolbarChildren: {
+    onNext: jest.fn(),
+    onPrevious: jest.fn(),
+    title: "1 of 2",
+    total: 2,
+    currentIndex: 1
+  },
+  location: { query: {} }
 };
 
 describe("when contact is not within texting hours...", () => {
@@ -114,6 +124,10 @@ describe("when contact is not within texting hours...", () => {
           assignment={propsWithEnforcedTextingHoursCampaign.assignment}
           refreshData={propsWithEnforcedTextingHoursCampaign.refreshData}
           contact={propsWithEnforcedTextingHoursCampaign.contact}
+          navigationToolbarChildren={
+            propsWithEnforcedTextingHoursCampaign.navigationToolbarChildren
+          }
+          location={propsWithEnforcedTextingHoursCampaign.location}
         />
       </MuiThemeProvider>
     );
@@ -142,6 +156,10 @@ describe("when contact is within texting hours...", () => {
           assignment={propsWithEnforcedTextingHoursCampaign.assignment}
           refreshData={propsWithEnforcedTextingHoursCampaign.refreshData}
           contact={propsWithEnforcedTextingHoursCampaign.contact}
+          navigationToolbarChildren={
+            propsWithEnforcedTextingHoursCampaign.navigationToolbarChildren
+          }
+          location={propsWithEnforcedTextingHoursCampaign.location}
         />
       </MuiThemeProvider>
     );

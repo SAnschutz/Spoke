@@ -5,6 +5,7 @@ import User from "./user";
 import PendingMessagePart from "./pending-message-part";
 import Organization from "./organization";
 import Campaign from "./campaign";
+import CampaignAdmin from "./campaign-admin";
 import Assignment from "./assignment";
 import CampaignContact from "./campaign-contact";
 import InteractionStep from "./interaction-step";
@@ -18,6 +19,8 @@ import UserCell from "./user-cell";
 import Message from "./message";
 import ZipCode from "./zip-code";
 import Log from "./log";
+import Tag from "./tag";
+import TagCampaignContact from "./tag-campaign-contact";
 
 import thinky from "./thinky";
 import datawarehouse from "./datawarehouse";
@@ -31,10 +34,13 @@ function createLoader(model, opts) {
     if (cacheObj && cacheObj.load) {
       return keys.map(async key => await cacheObj.load(key));
     }
-    const docs = await model.getAll(...keys, { index: idKey });
-    return keys.map(key =>
-      docs.find(doc => doc[idKey].toString() === key.toString())
-    );
+    const docs = await thinky.r
+      .knexReadOnly(model.tableName)
+      .whereIn(idKey, keys);
+    return keys.map(key => {
+      const result = docs.find(doc => doc[idKey].toString() === key.toString());
+      return result ? new model(result) : null;
+    });
   });
 }
 
@@ -43,8 +49,10 @@ const tableList = [
   "organization", // good candidate?
   "user", // good candidate
   "campaign", // good candidate
+  "campaign_admin",
   "assignment",
   // the rest are alphabetical
+  "assignment_feedback",
   "campaign_contact", // ?good candidate (or by cell)
   "canned_response", // good candidate
   "interaction_step",
@@ -55,6 +63,10 @@ const tableList = [
   "opt_out", // good candidate
   "pending_message_part",
   "question_response",
+  "tag",
+  "tag_campaign_contact",
+  "tag_canned_response",
+  "owned_phone_number",
   "user_cell",
   "user_organization",
   "zip_code" // good candidate (or by contact)?
@@ -81,10 +93,24 @@ function dropTables() {
   });
 }
 
-const loaders = {
+const truncateTables = async () => {
+  // FUTURE: maybe this would speed up tests?
+  // Tentative experiments suggest it might shave a minute off
+  const isSqlite = /sqlite/.test(thinky.k.client.config.client);
+  if (isSqlite) {
+    await Promise.all(tableList.map(t => thinky.k(t).truncate()));
+  } else {
+    // Postgres lets (and requires) that you drop them all at once
+    await thinky.k.raw(
+      'TRUNCATE "' + tableList.join('", "') + '" RESTART IDENTITY'
+    );
+  }
+};
+
+const createLoaders = () => ({
   // Note: loaders with cacheObj should also run loaders.XX.clear(id)
   //  on clear on the cache as well.
-  assignment: createLoader(Assignment),
+  assignment: createLoader(Assignment, { cacheObj: cacheableData.assignment }),
   campaign: createLoader(Campaign, { cacheObj: cacheableData.campaign }),
   invite: createLoader(Invite),
   organization: createLoader(Organization, {
@@ -92,7 +118,9 @@ const loaders = {
   }),
   user: createLoader(User),
   interactionStep: createLoader(InteractionStep),
-  campaignContact: createLoader(CampaignContact),
+  campaignContact: createLoader(CampaignContact, {
+    cacheObj: cacheableData.campaignContact
+  }),
   zipCode: createLoader(ZipCode, { idKey: "zip" }),
   log: createLoader(Log),
   cannedResponse: createLoader(CannedResponse),
@@ -103,14 +131,17 @@ const loaders = {
   questionResponse: createLoader(QuestionResponse),
   userCell: createLoader(UserCell),
   userOrganization: createLoader(UserOrganization)
-};
-
-const createLoaders = () => loaders;
+});
 
 const r = thinky.r;
 
+if (process.env.ENABLE_KNEX_TRACING === "true") {
+  r.knex.on("query", ({ sql, bindings }) =>
+    console.debug("TRACE:", sql, bindings)
+  );
+}
+
 export {
-  loaders,
   createLoaders,
   r,
   cacheableData,
@@ -118,8 +149,10 @@ export {
   createTablesIfNecessary,
   dropTables,
   datawarehouse,
+  truncateTables,
   Assignment,
   Campaign,
+  CampaignAdmin,
   CampaignContact,
   InteractionStep,
   Invite,
@@ -134,5 +167,7 @@ export {
   UserOrganization,
   User,
   ZipCode,
-  Log
+  Log,
+  Tag,
+  TagCampaignContact
 };

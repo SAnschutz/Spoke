@@ -21,3 +21,7 @@ coverage/
 *.vscode
 *.rdb
 package-lock.json
+CONFIG_FILE.json
+scratch/
+cypress/screenshots
+cypress/videos

@@ -7,8 +7,7 @@ import { StyleSheet, css } from "aphrodite";
 import Dialog from "material-ui/Dialog";
 import FlatButton from "material-ui/FlatButton";
 
-import loadData from "../../containers//hoc/load-data";
-import wrapMutations from "../../containers/hoc/wrap-mutations";
+import loadData from "../../containers/hoc/load-data";
 import GSForm from "../../components/forms/GSForm";
 import SendButton from "../../components/SendButton";
 
@@ -25,19 +24,19 @@ class MessageResponse extends Component {
     this.state = {
       messageText: "",
       isSending: false,
-      sendError: ""
+      sendError: "",
+      doneFirstClick: false
     };
 
     this.handleCloseErrorDialog = this.handleCloseErrorDialog.bind(this);
   }
 
   createMessageToContact(text) {
-    const { contact, texter } = this.props.conversation;
+    const { cell, assignmentId } = this.props.conversation;
 
     return {
-      assignmentId: contact.assignmentId,
-      contactNumber: contact.cell,
-      userId: texter.id,
+      assignmentId: assignmentId,
+      contactNumber: cell,
       text
     };
   }
@@ -45,18 +44,25 @@ class MessageResponse extends Component {
   handleMessageFormChange = ({ messageText }) => this.setState({ messageText });
 
   handleMessageFormSubmit = async ({ messageText }) => {
-    const { contact } = this.props.conversation;
-    const message = this.createMessageToContact(messageText);
     if (this.state.isSending) {
       return; // stops from multi-send
     }
+
+    if (window.TEXTER_TWOCLICK && !this.state.doneFirstClick) {
+      this.setState({ doneFirstClick: true }); // Enforce TEXTER_TWOCLICK
+      return;
+    }
+
+    const { campaignContactId } = this.props.conversation;
+    const message = this.createMessageToContact(messageText);
+
     this.setState({ isSending: true });
 
-    const finalState = { isSending: false };
+    const finalState = { isSending: false, doneFirstClick: false };
     try {
       const response = await this.props.mutations.sendMessage(
         message,
-        contact.id
+        campaignContactId
       );
       const { messages } = response.data.sendMessage;
       this.props.messagesChanged(messages);
@@ -84,7 +90,7 @@ class MessageResponse extends Component {
         .max(window.MAX_MESSAGE_LENGTH)
     });
 
-    const { messageText, isSending } = this.state;
+    const { messageText, isSending, doneFirstClick } = this.state;
     const isSendDisabled = isSending || messageText.trim() === "";
 
     const errorActions = [
@@ -114,9 +120,9 @@ class MessageResponse extends Component {
               }}
             >
               <SendButton
-                threeClickEnabled={false}
                 onFinalTouchTap={this.handleClickSendMessageButton}
                 disabled={isSendDisabled}
+                doneFirstClick={doneFirstClick}
               />
             </div>
             <div style={{ marginRight: "120px" }}>
@@ -149,8 +155,8 @@ MessageResponse.propTypes = {
   messagesChanged: PropTypes.func
 };
 
-const mapMutationsToProps = () => ({
-  sendMessage: (message, campaignContactId) => ({
+const mutations = {
+  sendMessage: ownProps => (message, campaignContactId) => ({
     mutation: gql`
       mutation sendMessage(
         $message: MessageInput!
@@ -173,8 +179,6 @@ const mapMutationsToProps = () => ({
       campaignContactId
     }
   })
-});
+};
 
-export default loadData(wrapMutations(MessageResponse), {
-  mapMutationsToProps
-});
+export default loadData({ mutations })(MessageResponse);

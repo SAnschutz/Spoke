@@ -1,30 +1,55 @@
 import {
   r,
-  datawarehouse,
   cacheableData,
   Assignment,
   Campaign,
-  CampaignContact,
   Organization,
   User,
   UserOrganization
 } from "../server/models";
+import telemetry from "../server/telemetry";
 import { log, gunzip, zipToTimeZone, convertOffsetsToStrings } from "../lib";
-import { updateJob } from "./lib";
-import { getFormattedPhoneNumber } from "../lib/phone-format.js";
+import { sleep, updateJob } from "./lib";
 import serviceMap from "../server/api/lib/services";
+import twilio from "../server/api/lib/twilio";
 import {
   getLastMessage,
   saveNewIncomingMessage
 } from "../server/api/lib/message-sending";
-import importScriptFromDocument from "../server/api/lib/import-script.";
+import importScriptFromDocument from "../server/api/lib/import-script";
+import { rawIngestMethod } from "../extensions/contact-loaders";
 
 import AWS from "aws-sdk";
 import Papa from "papaparse";
 import moment from "moment";
 import { sendEmail } from "../server/mail";
 import { Notifications, sendUserNotification } from "../server/notifications";
-import { unzip } from "zlib";
+import { getConfig } from "../server/api/lib/config";
+import { invokeTaskFunction, Tasks } from "./tasks";
+import fs from "fs";
+import path from "path";
+
+const defensivelyDeleteOldJobsForCampaignJobType = async job => {
+  console.log("job", job);
+  let retries = 0;
+  const doDelete = async () => {
+    try {
+      await r
+        .knex("job_request")
+        .where({ campaign_id: job.campaign_id, job_type: job.job_type })
+        .whereNot({ id: job.id })
+        .delete();
+    } catch (err) {
+      if (retries < 5) {
+        retries += 1;
+        await doDelete();
+      } else
+        console.error(`Could not delete campaign/jobType. Err: ${err.message}`);
+    }
+  };
+
+  await doDelete();
+};
 
 const defensivelyDeleteJob = async job => {
   if (job.id) {
@@ -39,7 +64,7 @@ const defensivelyDeleteJob = async job => {
         if (retries < 5) {
           retries += 1;
           await deleteJob();
-        } else log.error(`Could not delete job. Err: ${err.message}`);
+        } else console.error(`Could not delete job. Err: ${err.message}`);
       }
     };
 
@@ -48,23 +73,6 @@ const defensivelyDeleteJob = async job => {
 };
 
 const zipMemoization = {};
-let warehouseConnection = null;
-function optOutsByOrgId(orgId) {
-  return r.knex
-    .select("cell")
-    .from("opt_out")
-    .where("organization_id", orgId);
-}
-
-function optOutsByInstance() {
-  return r.knex.select("cell").from("opt_out");
-}
-
-function getOptOutSubQuery(orgId) {
-  return !!process.env.OPTOUTS_SHARE_ALL_ORGS
-    ? optOutsByInstance()
-    : optOutsByOrgId(orgId);
-}
 
 function optOutsByOrgId(orgId) {
   return r.knex
@@ -142,20 +150,20 @@ export async function sendJobToAWSLambda(job) {
   return p;
 }
 
-export async function processSqsMessages() {
+export async function processSqsMessages(TWILIO_SQS_QUEUE_URL) {
   // hit endpoint on SQS
   // ask for a list of messages from SQS (with quantity tied to it)
   // if SQS has messages, process messages into pending_message_part and dequeue messages (mark them as handled)
   // if SQS doesnt have messages, exit
 
-  if (!process.env.TWILIO_SQS_QUEUE_URL) {
+  if (!TWILIO_SQS_QUEUE_URL) {
     return Promise.reject("TWILIO_SQS_QUEUE_URL not set");
   }
 
   const sqs = new AWS.SQS();
 
   const params = {
-    QueueUrl: process.env.TWILIO_SQS_QUEUE_URL,
+    QueueUrl: TWILIO_SQS_QUEUE_URL,
     AttributeNames: ["All"],
     MessageAttributeNames: ["string"],
     MaxNumberOfMessages: 10,
@@ -167,422 +175,184 @@ export async function processSqsMessages() {
   const p = new Promise((resolve, reject) => {
     sqs.receiveMessage(params, async (err, data) => {
       if (err) {
-        console.log(err, err.stack);
+        console.log("processSqsMessages Error", err, err.stack);
         reject(err);
-      } else if (data.Messages) {
-        console.log(data);
-        for (let i = 0; i < data.Messages.length; i++) {
-          const message = data.Messages[i];
-          const body = message.Body;
-          console.log("processing sqs queue:", body);
-          const twilioMessage = JSON.parse(body);
-
-          await serviceMap.twilio.handleIncomingMessage(twilioMessage);
-
-          sqs.deleteMessage(
-            {
-              QueueUrl: process.env.TWILIO_SQS_QUEUE_URL,
-              ReceiptHandle: message.ReceiptHandle
-            },
-            (delMessageErr, delMessageData) => {
-              if (delMessageErr) {
-                console.log(delMessageErr, delMessageErr.stack); // an error occurred
-              } else {
-                console.log(delMessageData); // successful response
-              }
+      } else {
+        if (!data.Messages || !data.Messages.length) {
+          // Since we are likely in a while(true) loop let's avoid racing
+          await sleep(10000);
+          resolve();
+        } else {
+          console.log("processSqsMessages", data.Messages.length);
+          for (let i = 0; i < data.Messages.length; i++) {
+            const message = data.Messages[i];
+            const body = message.Body;
+            if (process.env.DEBUG) {
+              console.log("processSqsMessages message body", body);
             }
-          );
+            const twilioMessage = JSON.parse(body);
+            await serviceMap.twilio.handleIncomingMessage(twilioMessage);
+            const delMessageData = await sqs
+              .deleteMessage({
+                QueueUrl: TWILIO_SQS_QUEUE_URL,
+                ReceiptHandle: message.ReceiptHandle
+              })
+              .promise()
+              .catch(reject);
+            if (process.env.DEBUG) {
+              console.log("processSqsMessages deleteresult", delMessageData);
+            }
+          }
+          resolve();
         }
-        resolve();
       }
     });
   });
   return p;
 }
 
-const unzipPayload = async job =>
-  JSON.parse(await gunzip(Buffer.from(job.payload, "base64")));
-
-export async function uploadContacts(job) {
-  const campaignId = job.campaign_id;
-  // We do this deletion in schema.js but we do it again here just in case the the queue broke and we had a backlog of contact uploads for one campaign
-  const campaign = await Campaign.get(campaignId);
-  const organization = await Organization.get(campaign.organization_id);
+export async function dispatchContactIngestLoad(job, organization) {
+  if (!organization) {
+    const campaign = await Campaign.get(job.campaign_id);
+    organization = await Organization.get(campaign.organization_id);
+  }
+  const ingestMethod = rawIngestMethod(job.job_type.replace("ingest.", ""));
+  if (!ingestMethod) {
+    console.error(
+      "dispatchContactIngestLoad not found. invalid job type",
+      job.job_type
+    );
+    return;
+  }
   const orgFeatures = JSON.parse(organization.features || "{}");
-
-  const jobMessages = [];
-
-  await r
-    .table("campaign_contact")
-    .getAll(campaignId, { index: "campaign_id" })
-    .delete();
-  const maxPercentage = 100;
-  let contacts = await unzipPayload(job);
-  const chunkSize = 1000;
-
   const maxContacts = parseInt(
     orgFeatures.hasOwnProperty("maxContacts")
       ? orgFeatures.maxContacts
       : process.env.MAX_CONTACTS || 0,
     10
   );
+  await ingestMethod.processContactLoad(job, maxContacts, organization);
+}
 
-  if (maxContacts) {
-    // note: maxContacts == 0 means no maximum
-    contacts = contacts.slice(0, maxContacts);
-  }
+export async function failedContactLoad(
+  job,
+  _,
+  ingestDataReference,
+  ingestResult
+) {
+  const campaignId = job.campaign_id;
+  const finalContactCount = await r.getCount(
+    r.knex("campaign_contact").where("campaign_id", campaignId)
+  );
 
-  const numChunks = Math.ceil(contacts.length / chunkSize);
-
-  for (let index = 0; index < contacts.length; index++) {
-    const datum = contacts[index];
-    if (datum.zip) {
-      // using memoization and large ranges of homogenous zips
-      datum.timezone_offset = await getTimezoneByZip(datum.zip);
-    }
-  }
-
-  for (let index = 0; index < numChunks; index++) {
-    await updateJob(job, Math.round((maxPercentage / numChunks) * index));
-    const savePortion = contacts.slice(
-      index * chunkSize,
-      (index + 1) * chunkSize
-    );
-    await CampaignContact.save(savePortion);
-  }
-
-  const optOutCellCount = await r
-    .knex("campaign_contact")
-    .whereIn("cell", function optouts() {
-      this.select("cell")
-        .from("opt_out")
-        .where("organization_id", campaign.organization_id);
+  await r
+    .knex("campaign_admin")
+    .where("campaign_id", campaignId)
+    .update({
+      deleted_optouts_count: null,
+      duplicate_contacts_count: null,
+      contacts_count: finalContactCount,
+      ingest_method: job.job_type.replace(/^ingest./, ""),
+      ingest_success: false,
+      ingest_result: ingestResult || null,
+      ingest_data_reference: ingestDataReference || null
     });
+  if (job.id) {
+    await r
+      .knex("job_request")
+      .where("id", job.id)
+      .delete();
+  }
+  await telemetry.reportEvent("Contact Load Failure", {
+    count: finalContactCount,
+    jobId: job.id,
+    campaignId,
+    ingestResult
+  });
+}
 
-  const deleteOptOutCells = await r
+export async function completeContactLoad(
+  job,
+  _,
+  ingestDataReference,
+  ingestResult
+) {
+  const campaignId = job.campaign_id;
+  const campaign = await Campaign.get(campaignId);
+  const organization = await Organization.get(campaign.organization_id);
+
+  let deleteOptOutCells = null;
+  let deleteDuplicateCells = null;
+  const knexOptOutDeleteResult = await r
     .knex("campaign_contact")
     .whereIn("cell", getOptOutSubQuery(campaign.organization_id))
     .where("campaign_id", campaignId)
     .delete()
     .then(result => {
-      console.log("deleted result: " + result);
+      deleteOptOutCells = result;
+      console.log("Deleted opt-outs: " + deleteOptOutCells);
+    })
+    .catch(err => {
+      console.log("Error deleting opt-outs:", campaignId, err);
     });
 
-  if (deleteOptOutCells) {
-    jobMessages.push(
-      `Number of contacts excluded due to their opt-out status: ${optOutCellCount}`
-    );
-  }
-
-  if (job.id) {
-    if (jobMessages.length) {
-      await r
-        .knex("job_request")
-        .where("id", job.id)
-        .update({ result_message: jobMessages.join("\n") });
-    } else {
-      await r
-        .table("job_request")
-        .get(job.id)
-        .delete();
-    }
-  }
-  await cacheableData.campaign.reload(campaignId);
-}
-
-export async function loadContactsFromDataWarehouseFragment(jobEvent) {
-  console.log(
-    "starting loadContactsFromDataWarehouseFragment",
-    jobEvent.campaignId,
-    jobEvent.limit,
-    jobEvent.offset,
-    jobEvent
-  );
-  const insertOptions = {
-    batchSize: 1000
-  };
-  const jobCompleted = await r
-    .knex("job_request")
-    .where("id", jobEvent.jobId)
-    .select("status")
-    .first();
-  if (!jobCompleted) {
-    console.log(
-      "loadContactsFromDataWarehouseFragment job no longer exists",
-      jobEvent.campaignId,
-      jobCompleted,
-      jobEvent
-    );
-    return { alreadyComplete: 1 };
-  }
-
-  let sqlQuery = jobEvent.query;
-  if (jobEvent.limit) {
-    sqlQuery += " LIMIT " + jobEvent.limit;
-  }
-  if (jobEvent.offset) {
-    sqlQuery += " OFFSET " + jobEvent.offset;
-  }
-  let knexResult;
-  try {
-    warehouseConnection = warehouseConnection || datawarehouse();
-    console.log(
-      "loadContactsFromDataWarehouseFragment RUNNING WAREHOUSE query",
-      sqlQuery
-    );
-    knexResult = await warehouseConnection.raw(sqlQuery);
-  } catch (err) {
-    // query failed
-    log.error("Data warehouse query failed: ", err);
-    jobMessages.push(`Data warehouse count query failed with ${err}`);
-    // TODO: send feedback about job
-  }
-  const fields = {};
-  const customFields = {};
-  const contactFields = {
-    first_name: 1,
-    last_name: 1,
-    cell: 1,
-    zip: 1,
-    external_id: 1
-  };
-  knexResult.fields.forEach(f => {
-    fields[f.name] = 1;
-    if (!(f.name in contactFields)) {
-      customFields[f.name] = 1;
-    }
-  });
-  if (!("first_name" in fields && "last_name" in fields && "cell" in fields)) {
-    log.error(
-      "SQL statement does not return first_name, last_name, and cell: ",
-      sqlQuery,
-      fields
-    );
-    jobMessages.push(
-      `SQL statement does not return first_name, last_name and cell => ${sqlQuery} => with fields ${fields}`
-    );
-    return;
-  }
-
-  const savePortion = await Promise.all(
-    knexResult.rows.map(async row => {
-      const formatCell = getFormattedPhoneNumber(
-        row.cell,
-        process.env.PHONE_NUMBER_COUNTRY || "US"
-      );
-      const contact = {
-        campaign_id: jobEvent.campaignId,
-        first_name: row.first_name || "",
-        last_name: row.last_name || "",
-        cell: formatCell,
-        zip: row.zip || "",
-        external_id: row.external_id ? String(row.external_id) : "",
-        assignment_id: null,
-        message_status: "needsMessage"
-      };
-      const contactCustomFields = {};
-      Object.keys(customFields).forEach(f => {
-        contactCustomFields[f] = row[f];
-      });
-      contact.custom_fields = JSON.stringify(contactCustomFields);
-      if (
-        contact.zip &&
-        !contactCustomFields.hasOwnProperty("timezone_offset")
-      ) {
-        contact.timezone_offset = getTimezoneByZip(contact.zip);
-      }
-      if (contactCustomFields.hasOwnProperty("timezone_offset")) {
-        contact.timezone_offset = contactCustomFields["timezone_offset"];
-      }
-      return contact;
-    })
-  );
-
-  await CampaignContact.save(savePortion, insertOptions);
-  await r
-    .knex("job_request")
-    .where("id", jobEvent.jobId)
-    .increment("status", 1);
-  const validationStats = {};
-  const completed = await r
-    .knex("job_request")
-    .where("id", jobEvent.jobId)
-    .select("status")
-    .first();
-  console.log(
-    "loadContactsFromDataWarehouseFragment toward end",
-    completed,
-    jobEvent
-  );
-
-  if (!completed) {
-    console.log(
-      "loadContactsFromDataWarehouseFragment job has been deleted",
-      completed,
-      jobEvent.campaignId
-    );
-  } else if (jobEvent.totalParts && completed.status >= jobEvent.totalParts) {
-    if (jobEvent.organizationId) {
-      // now that we've saved them all, we delete everyone that is opted out locally
-      // doing this in one go so that we can get the DB to do the indexed cell matching
-
-      // delete optout cells
-      await r
-        .knex("campaign_contact")
-        .whereIn("cell", getOptOutSubQuery(jobEvent.organizationId))
-        .where("campaign_id", jobEvent.campaignId)
-        .delete()
-        .then(result => {
-          console.log(
-            `loadContactsFromDataWarehouseFragment # of contacts opted out removed from DW query (${jobEvent.campaignId}): ${result}`
-          );
-          validationStats.optOutCount = result;
-        });
-
-      // delete invalid cells
-      await r
-        .knex("campaign_contact")
-        .whereRaw("length(cell) != 12")
-        .andWhere("campaign_id", jobEvent.campaignId)
-        .delete()
-        .then(result => {
-          console.log(
-            `loadContactsFromDataWarehouseFragment # of contacts with invalid cells removed from DW query (${jobEvent.campaignId}): ${result}`
-          );
-          validationStats.invalidCellCount = result;
-        });
-
-      // delete duplicate cells
-      await r
-        .knex("campaign_contact")
-        .whereIn(
-          "id",
-          r
-            .knex("campaign_contact")
-            .select("campaign_contact.id")
-            .leftJoin("campaign_contact AS c2", function joinSelf() {
-              this.on("c2.campaign_id", "=", "campaign_contact.campaign_id")
-                .andOn("c2.cell", "=", "campaign_contact.cell")
-                .andOn("c2.id", ">", "campaign_contact.id");
-            })
-            .where("campaign_contact.campaign_id", jobEvent.campaignId)
-            .whereNotNull("c2.id")
-        )
-        .delete()
-        .then(result => {
-          console.log(
-            `loadContactsFromDataWarehouseFragment # of contacts with duplicate cells removed from DW query (${jobEvent.campaignId}): ${result}`
-          );
-          validationStats.duplicateCellCount = result;
-        });
-    }
-    await r
-      .table("job_request")
-      .get(jobEvent.jobId)
-      .delete();
-    await cacheableData.campaign.reload(jobEvent.campaignId);
-    return { completed: 1, validationStats };
-  } else if (jobEvent.part < jobEvent.totalParts - 1) {
-    const newPart = jobEvent.part + 1;
-    const newJob = {
-      ...jobEvent,
-      part: newPart,
-      offset: newPart * jobEvent.step,
-      limit: jobEvent.step,
-      command: "loadContactsFromDataWarehouseFragmentJob"
-    };
-    if (process.env.WAREHOUSE_DB_LAMBDA_ITERATION) {
-      console.log(
-        "SENDING TO LAMBDA loadContactsFromDataWarehouseFragment",
-        newJob
-      );
-      await sendJobToAWSLambda(newJob);
-      return { invokedAgain: 1 };
-    } else {
-      return loadContactsFromDataWarehouseFragment(newJob);
-    }
-  }
-}
-
-export async function loadContactsFromDataWarehouse(job) {
-  console.log("STARTING loadContactsFromDataWarehouse", job.payload);
-  const jobMessages = [];
-  const sqlQuery = job.payload;
-
-  if (!sqlQuery.startsWith("SELECT") || sqlQuery.indexOf(";") >= 0) {
-    log.error(
-      "Malformed SQL statement.  Must begin with SELECT and not have any semicolons: ",
-      sqlQuery
-    );
-    return;
-  }
-  if (!datawarehouse) {
-    log.error("No data warehouse connection, so cannot load contacts", job);
-    return;
-  }
-
-  let knexCountRes;
-  let knexCount;
-  try {
-    warehouseConnection = warehouseConnection || datawarehouse();
-    knexCountRes = await warehouseConnection.raw(
-      `SELECT COUNT(*) FROM ( ${sqlQuery} ) AS QUERYCOUNT`
-    );
-  } catch (err) {
-    log.error("Data warehouse count query failed: ", err);
-    jobMessages.push(`Data warehouse count query failed with ${err}`);
-  }
-
-  if (knexCountRes) {
-    knexCount = knexCountRes.rows[0].count;
-    if (!knexCount || knexCount == 0) {
-      jobMessages.push("Error: Data warehouse query returned zero results");
-    }
-  }
-
-  const STEP =
-    r.kninky && r.kninky.defaultsUnsupported
-      ? 10 // sqlite has a max of 100 variables and ~8 or so are used per insert
-      : 10000; // default
-  const campaign = await Campaign.get(job.campaign_id);
-  const totalParts = Math.ceil(knexCount / STEP);
-
-  if (totalParts > 1 && /LIMIT/.test(sqlQuery)) {
-    // We do naive string concatenation when we divide queries up for parts
-    // just appending " LIMIT " and " OFFSET " arguments.
-    // If there is already a LIMIT in the query then we'll be unable to do that
-    // so we error out.  Note that if the total is < 10000, then LIMIT will be respected
-    jobMessages.push(
-      `Error: LIMIT in query not supported for results larger than ${STEP}. Count was ${knexCount}`
-    );
-  }
-
-  if (job.id && jobMessages.length) {
-    let resultMessages = await r
-      .knex("job_request")
-      .where("id", job.id)
-      .update({ result_message: jobMessages.join("\n") });
-    return resultMessages;
-  }
-
+  // delete duplicate cells (last wins)
   await r
     .knex("campaign_contact")
-    .where("campaign_id", job.campaign_id)
-    .delete();
+    .whereNotIn(
+      "id",
+      r
+        .knex("campaign_contact")
+        .select(r.knex.raw("max(id) as id"))
+        .where("campaign_id", campaignId)
+        .groupBy("cell")
+    )
+    .where("campaign_contact.campaign_id", campaignId)
+    .delete()
+    .then(result => {
+      deleteDuplicateCells = result;
+      console.log("Deduplication result", campaignId, result);
+    })
+    .catch(err => {
+      deleteDuplicateCells = -1;
+      console.error("Failed deduplication", campaignId, err);
+    });
 
-  await loadContactsFromDataWarehouseFragment({
+  const finalContactCount = await r.getCount(
+    r.knex("campaign_contact").where("campaign_id", campaignId)
+  );
+
+  await r
+    .knex("campaign_admin")
+    .where("campaign_id", campaignId)
+    .update({
+      deleted_optouts_count: deleteOptOutCells,
+      duplicate_contacts_count: deleteDuplicateCells,
+      contacts_count: finalContactCount,
+      ingest_method: job.job_type.replace(/^ingest./, ""),
+      ingest_success: true,
+      ingest_result: ingestResult || null,
+      ingest_data_reference: ingestDataReference || null
+    });
+  if (job.id) {
+    await r
+      .knex("job_request")
+      .where("id", job.id)
+      .delete();
+  }
+  await cacheableData.campaign.reload(campaignId);
+  await telemetry.reportEvent("Contact Load", {
+    count: finalContactCount,
     jobId: job.id,
-    query: sqlQuery,
-    campaignId: job.campaign_id,
-    jobMessages,
-    // beyond job object:
-    organizationId: campaign.organization_id,
-    totalParts,
-    totalCount: knexCount,
-    step: STEP,
-    part: 0,
-    limit: totalParts > 1 ? STEP : 0 // 0 is unlimited
+    campaignId,
+    deleteOptOutCells,
+    deleteDuplicateCells,
+    ingestResult
   });
+}
+
+export async function unzipPayload(job) {
+  return JSON.parse(await gunzip(Buffer.from(job.payload, "base64")));
 }
 
 export async function assignTexters(job) {
@@ -661,8 +431,10 @@ export async function assignTexters(job) {
 
   TODO: what happens when we switch modes? Do we allow it?
   */
+
   const payload = JSON.parse(job.payload);
   const cid = job.campaign_id;
+  console.log("assignTexters1", cid, payload);
   const campaign = (await r.knex("campaign").where({ id: cid }))[0];
   const texters = payload.texters;
   const currentAssignments = await r
@@ -810,6 +582,7 @@ export async function assignTexters(job) {
           .knex("assignment")
           .where({ id: existingAssignment.id })
           .update({ max_contacts: maxContacts });
+        cacheableData.assignment.clear(existingAssignment.id);
       }
     } else {
       assignment = await new Assignment({
@@ -870,6 +643,13 @@ export async function assignTexters(job) {
       .catch(log.error);
   }
 
+  if (campaign.is_started) {
+    console.log("assignTexterscache1", job.campaign_id);
+    await cacheableData.campaignContact.updateCampaignAssignmentCache(
+      job.campaign_id
+    );
+  }
+
   if (job.id) {
     await r
       .table("job_request")
@@ -879,9 +659,11 @@ export async function assignTexters(job) {
 }
 
 export async function exportCampaign(job) {
+  console.log("exportingCampaign", job);
   const payload = JSON.parse(job.payload);
   const id = job.campaign_id;
   const campaign = await Campaign.get(id);
+  const organization = await Organization.get(campaign.organization_id);
   const requester = payload.requester;
   const user = await User.get(requester);
   const allQuestions = {};
@@ -889,6 +671,12 @@ export async function exportCampaign(job) {
   const interactionSteps = await r
     .table("interaction_step")
     .getAll(id, { index: "campaign_id" });
+
+  const combineSameQuestions = getConfig(
+    "EXPORT_COMBINE_SAME_QUESTIONS",
+    organization,
+    { truthy: 1 }
+  );
 
   interactionSteps.forEach(step => {
     if (!step.question || step.question.trim() === "") {
@@ -901,113 +689,139 @@ export async function exportCampaign(job) {
       questionCount[step.question] = 0;
     }
     const currentCount = questionCount[step.question];
-    if (currentCount > 0) {
+
+    if (currentCount > 0 && !combineSameQuestions) {
       allQuestions[step.id] = `${step.question}_${currentCount}`;
     } else {
       allQuestions[step.id] = step.question;
     }
   });
+  const questionResponses = await r
+    .knexReadOnly("question_response")
+    .join("campaign_contact", "campaign_contact.id", "campaign_contact_id")
+    .where("campaign_id", campaign.id)
+    .select("campaign_contact_id", "interaction_step_id", "value");
 
-  let finalCampaignResults = [];
-  let finalCampaignMessages = [];
-  const assignments = await r
-    .knex("assignment")
-    .where("campaign_id", id)
-    .join("user", "user_id", "user.id")
-    .select(
-      "assignment.id as id",
-      // user fields
-      "first_name",
-      "last_name",
-      "email",
-      "cell",
-      "assigned_cell"
-    );
-  const assignmentCount = assignments.length;
+  const tags = await r
+    .knexReadOnly("tag_campaign_contact")
+    .join("campaign_contact", "campaign_contact.id", "campaign_contact_id")
+    .join("tag", "tag.id", "tag_id")
+    .where("campaign_id", campaign.id)
+    .select("campaign_contact_id", "name");
+  const contactTags = tags.reduce((acc, cur) => {
+    if (acc[cur.campaign_contact_id]) {
+      acc[cur.campaign_contact_id].push(cur.name);
+    } else {
+      acc[cur.campaign_contact_id] = [cur.name];
+    }
+    return acc;
+  }, {});
 
-  for (let index = 0; index < assignmentCount; index++) {
-    const assignment = assignments[index];
-    const optOuts = await r
-      .table("opt_out")
-      .getAll(assignment.id, { index: "assignment_id" });
-
-    const contacts = await r
-      .knex("campaign_contact")
-      .leftJoin("zip_code", "zip_code.zip", "campaign_contact.zip")
-      .select()
-      .where("assignment_id", assignment.id);
-    const messages = await r
-      .table("message")
-      .getAll(assignment.id, { index: "assignment_id" });
-    let convertedMessages = messages.map(message => {
-      const messageRow = {
-        assignmentId: message.assignment_id,
-        campaignId: campaign.id,
-        userNumber: message.user_number,
-        contactNumber: message.contact_number,
-        isFromContact: message.is_from_contact,
-        sendStatus: message.send_status,
-        attemptedAt: moment(message.created_at).toISOString(),
-        text: message.text
+  const optOutJoins = process.env.OPTOUTS_SHARE_ALL_ORGS
+    ? { "opt_out.cell": "campaign_contact.cell" }
+    : {
+        "opt_out.cell": "campaign_contact.cell",
+        "opt_out.organization_id": r.knexReadOnly.raw(campaign.organization_id)
       };
-      return messageRow;
+  const contacts = await r
+    .knexReadOnly("campaign_contact")
+    .join("assignment", "campaign_contact.assignment_id", "assignment.id")
+    .join("user", "assignment.user_id", "user.id")
+    .leftJoin("zip_code", "zip_code.zip", "campaign_contact.zip")
+    .leftJoin("opt_out", optOutJoins)
+    .column([
+      "campaign_contact.id",
+      "campaign_contact.campaign_id",
+      "campaign_contact.assignment_id",
+      { optOutCampaign: "campaign_contact.is_opted_out" },
+      { optedOut: "opt_out.created_at" },
+      { texterFirst: "user.first_name" },
+      { texterLast: "user.last_name" },
+      { texterEmail: "user.email" },
+      { texterCell: "user.cell" },
+      { texterAlias: "user.alias" },
+      "user.extra",
+      "campaign_contact.external_id",
+      "campaign_contact.first_name",
+      "campaign_contact.last_name",
+      "campaign_contact.cell",
+      "zip_code.city",
+      "zip_code.state",
+      "campaign_contact.zip",
+      "campaign_contact.custom_fields",
+      "campaign_contact.message_status",
+      "campaign_contact.error_code"
+    ])
+    .select()
+    .where("campaign_contact.campaign_id", campaign.id);
+
+  contacts.forEach((row, index) => {
+    // Split Custom fields into columns
+    const customFields = JSON.parse(row.custom_fields);
+    delete row.custom_fields;
+
+    // Add question response columns
+    const responses = {};
+    Object.keys(allQuestions).forEach(stepId => {
+      const { value = "" } =
+        questionResponses.find(response => {
+          return (
+            response.campaign_contact_id === row.id &&
+            response.interaction_step_id === Number(stepId)
+          );
+        }) || {};
+
+      if (
+        value === "" &&
+        !responses.hasOwnProperty(`question[${allQuestions[stepId]}]`)
+      ) {
+        responses[`question[${allQuestions[stepId]}]`] = "";
+      } else if (
+        value !== "" &&
+        combineSameQuestions &&
+        responses[`question[${allQuestions[stepId]}]`] &&
+        responses[`question[${allQuestions[stepId]}]`] !== value
+      ) {
+        // join multiple different answers, otherwise combine answers too
+        responses[`question[${allQuestions[stepId]}]`] += `, ${value}`;
+      } else if (value !== "") {
+        responses[`question[${allQuestions[stepId]}]`] = value;
+      }
     });
 
-    convertedMessages = await Promise.all(convertedMessages);
-    finalCampaignMessages = finalCampaignMessages.concat(convertedMessages);
-    let convertedContacts = contacts.map(async contact => {
-      const contactRow = {
-        campaignId: campaign.id,
-        campaign: campaign.title,
-        assignmentId: assignment.id,
-        "texter[firstName]": assignment.first_name,
-        "texter[lastName]": assignment.last_name,
-        "texter[email]": assignment.email,
-        "texter[cell]": assignment.cell,
-        "texter[assignedCell]": assignment.assigned_cell,
-        "contact[firstName]": contact.first_name,
-        "contact[lastName]": contact.last_name,
-        "contact[cell]": contact.cell,
-        "contact[zip]": contact.zip,
-        "contact[city]": contact.city ? contact.city : null,
-        "contact[state]": contact.state ? contact.state : null,
-        "contact[optOut]": optOuts.find(ele => ele.cell === contact.cell)
-          ? "true"
-          : "false",
-        "contact[messageStatus]": contact.message_status,
-        "contact[external_id]": contact.external_id
-      };
-      const customFields = JSON.parse(contact.custom_fields);
-      Object.keys(customFields).forEach(fieldName => {
-        contactRow[`contact[${fieldName}]`] = customFields[fieldName];
-      });
+    contacts[index] = {
+      ...row,
+      texterExtra: row.extra ? JSON.stringify(row.extra) : "",
+      ...customFields,
+      tags: contactTags[row.id] ? contactTags[row.id].join(", ") : "",
+      ...responses
+    };
+    delete contacts[index]["extra"];
+  });
 
-      const questionResponses = await r
-        .table("question_response")
-        .getAll(contact.id, { index: "campaign_contact_id" });
+  const messages = await r
+    .knexReadOnly("message")
+    .join("campaign_contact", "campaign_contact.id", "campaign_contact_id")
+    .column([
+      "campaign_contact_id",
+      "campaign_id",
+      "user_number",
+      "contact_number",
+      "is_from_contact",
+      "send_status",
+      { attempted_at: "message.created_at" },
+      "text",
+      "message.error_code"
+    ])
+    .select()
+    .where("campaign_contact.campaign_id", campaign.id);
 
-      Object.keys(allQuestions).forEach(stepId => {
-        let value = "";
-        questionResponses.forEach(response => {
-          if (response.interaction_step_id === parseInt(stepId, 10)) {
-            value = response.value;
-          }
-        });
-
-        contactRow[`question[${allQuestions[stepId]}]`] = value;
-      });
-
-      return contactRow;
-    });
-    convertedContacts = await Promise.all(convertedContacts);
-    finalCampaignResults = finalCampaignResults.concat(convertedContacts);
-    await updateJob(job, Math.round((index / assignmentCount) * 100));
-  }
-  const campaignCsv = Papa.unparse(finalCampaignResults);
-  const messageCsv = Papa.unparse(finalCampaignMessages);
-
+  const campaignCsv = Papa.unparse(contacts);
+  const messageCsv = Papa.unparse(messages);
+  const exportResults = {};
+  console.log("exportCampaign csvs", campaignCsv.length, messageCsv.length);
   if (
-    process.env.AWS_ACCESS_AVAILABLE ||
+    getConfig("AWS_ACCESS_AVAILABLE") ||
     (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
   ) {
     try {
@@ -1035,6 +849,9 @@ export async function exportCampaign(job) {
         "getObject",
         params
       );
+      exportResults.campaignExportUrl = campaignExportUrl;
+      exportResults.campaignMessagesExportUrl = campaignMessagesExportUrl;
+
       await sendEmail({
         to: user.email,
         subject: `Export ready for ${campaign.title}`,
@@ -1049,6 +866,7 @@ export async function exportCampaign(job) {
       log.info(`Successfully exported ${id}`);
     } catch (err) {
       log.error(err);
+      exportResults.error = err.message;
       await sendEmail({
         to: user.email,
         subject: `Export failed for ${campaign.title}`,
@@ -1056,24 +874,41 @@ export async function exportCampaign(job) {
         Error: ${err.message}`
       });
     }
+  } else if (process.env.NODE_ENV !== "production") {
+    const contactsFile = `./campaign-export-${campaign.id}.csv`;
+    const messagesFile = `./campaign-export-${campaign.id}-message.csv`;
+    exportResults.campaignExportUrl =
+      "file://" + path.resolve("./", contactsFile);
+    exportResults.campaignMessagesExportUrl =
+      "file://" + path.resolve("./", messagesFile);
+
+    console.log(`Writing CSVs to ${contactsFile} and ${messagesFile}`);
+    fs.writeFileSync(contactsFile, campaignCsv);
+    fs.writeFileSync(messagesFile, messageCsv);
   } else {
-    log.debug("Would have saved the following to S3:");
+    console.log("Would have saved the following to S3:");
     log.debug(campaignCsv);
     log.debug(messageCsv);
   }
-
+  if (exportResults.campaignExportUrl) {
+    exportResults.createdAt = String(new Date());
+    await cacheableData.campaign.saveExportData(campaign.id, exportResults);
+  }
   await defensivelyDeleteJob(job);
 }
+
 export async function importScript(job) {
   const payload = await unzipPayload(job);
   try {
+    await defensivelyDeleteOldJobsForCampaignJobType(job);
     await importScriptFromDocument(payload.campaignId, payload.url); // TODO try/catch
+    console.log(`Script import complete ${payload.campaignId} ${payload.url}`);
   } catch (exception) {
     await r
       .knex("job_request")
       .where("id", job.id)
-      .update({ result_message: exception.message });
-    console.log(exception.message);
+      .update({ result_message: exception.message, status: -1 });
+    console.warn(exception.message);
     return;
   }
   defensivelyDeleteJob(job);
@@ -1084,59 +919,97 @@ export async function importScript(job) {
 let pastMessages = [];
 
 export async function sendMessages(queryFunc, defaultStatus) {
+  let trySendCount = 0;
   try {
-    await knex.transaction(async trx => {
-      let messages = [];
-      try {
-        let messageQuery = r
-          .knex("message")
-          .transacting(trx)
-          .forUpdate()
-          .where({ send_status: defaultStatus || "QUEUED" });
-
-        if (queryFunc) {
-          messageQuery = queryFunc(messageQuery);
-        }
-
-        messages = await messageQuery.orderBy("created_at");
-      } catch (err) {
-        // Unable to obtain lock on these rows meaning another process must be
-        // sending them. We will exit gracefully in that case.
-        trx.rollback();
-        return;
+    const trx = await r.knex.transaction();
+    let messages = [];
+    try {
+      let messageQuery = trx("message")
+        .forUpdate()
+        .where({ send_status: defaultStatus || "QUEUED" })
+        .join(
+          "campaign_contact",
+          "campaign_contact.id",
+          "message.campaign_contact_id"
+        )
+        .join("campaign", "campaign.id", "campaign_contact.campaign_id")
+        .join("organization", "organization.id", "campaign.organization_id")
+        .select(
+          "message.*",
+          // These are the fields we need for message sending
+          "campaign_contact.campaign_id",
+          "campaign_contact.message_status",
+          "campaign.messageservice_sid",
+          "campaign.organization_id",
+          "organization.features"
+        );
+      if (queryFunc) {
+        messageQuery = queryFunc(messageQuery);
       }
 
-      try {
-        for (let index = 0; index < messages.length; index++) {
-          let message = messages[index];
-          if (pastMessages.indexOf(message.id) !== -1) {
-            throw new Error(
-              "Encountered send message request of the same message." +
-                " This is scary!  If ok, just restart process. Message ID: " +
-                message.id
-            );
-          }
-          message.service = message.service || process.env.DEFAULT_SERVICE;
-          const service = serviceMap[message.service];
-          log.info(
-            `Sending (${message.service}): ${message.user_number} -> ${message.contact_number}\nMessage: ${message.text}`
+      messages = await messageQuery.orderBy("created_at");
+    } catch (err) {
+      // Unable to obtain lock on these rows meaning another process must be
+      // sending them. We will exit gracefully in that case.
+      console.info("LOCKED ROWS", err);
+      trx.rollback();
+      return 0;
+    }
+
+    try {
+      for (let index = 0; index < messages.length; index++) {
+        let message = messages[index];
+        if (pastMessages.indexOf(message.id) !== -1) {
+          throw new Error(
+            "Encountered send message request of the same message." +
+              " This is scary!  If ok, just restart process. Message ID: " +
+              message.id
           );
-          await service.sendMessage(message, null, trx);
+        }
+        message.service = message.service || process.env.DEFAULT_SERVICE;
+        const service = serviceMap[message.service];
+        log.info(
+          `Sending (${message.service}): ${message.user_number} -> ${message.contact_number}\nMessage: ${message.text}`
+        );
+        try {
+          await service.sendMessage(
+            message,
+            {
+              // reconstruct contact
+              id: message.campaign_contact_id,
+              message_status: message.message_status,
+              campaign_id: message.campaign_id
+            },
+            trx,
+            {
+              // organization
+              id: message.organization_id,
+              features: message.features
+            },
+            {
+              // campaign
+              id: message.campaign_id,
+              organization_id: message.organization_id,
+              messageservice_sid: message.messageservice_sid
+            }
+          );
           pastMessages.push(message.id);
           pastMessages = pastMessages.slice(-100); // keep the last 100
+        } catch (err) {
+          console.error("Failed sendMessage", err);
         }
-
-        trx.commit();
-      } catch (err) {
-        console.log("error sending messages:");
-        console.error(err);
-        trx.rollback();
+        trySendCount += 1;
       }
-    });
+      await trx.commit();
+    } catch (err) {
+      console.error("Error sending messages:", err);
+      await trx.rollback();
+    }
   } catch (err) {
     console.log("sendMessages transaction errored:");
     console.error(err);
   }
+  return trySendCount;
 }
 
 export async function handleIncomingMessageParts() {
@@ -1251,6 +1124,45 @@ export async function handleIncomingMessageParts() {
   }
 }
 
+export async function loadMessages(csvFile) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(csvFile, {
+      header: true,
+      complete: ({ data, meta, errors }, file) => {
+        const fields = meta.fields;
+        console.log("FIELDS", fields);
+        console.log("FIRST LINE", data[0]);
+        const promises = [];
+        data.forEach(row => {
+          if (!row.contact_number) {
+            return;
+          }
+          const twilioMessage = {
+            From: `+1${row.contact_number}`,
+            To: `+1${row.user_number}`,
+            Body: row.text,
+            MessageSid: row.service_id,
+            MessagingServiceSid: row.service_id,
+            FromZip: row.zip, // unused at the moment
+            spokeCreatedAt: row.created_at
+          };
+          promises.push(serviceMap.twilio.handleIncomingMessage(twilioMessage));
+        });
+        console.log("Started all promises for CSV");
+        Promise.all(promises)
+          .then(doneDid => {
+            console.log(`Processed ${doneDid.length} rows for CSV`);
+            resolve(doneDid);
+          })
+          .catch(err => {
+            console.error("Error processing for CSV", err);
+            reject(err);
+          });
+      }
+    });
+  });
+}
+
 // Temporary fix for orgless users
 // See https://github.com/MoveOnOrg/Spoke/issues/934
 // and job-processes.js
@@ -1272,7 +1184,7 @@ export async function fixOrgless() {
       });
       console.log(
         "added orgless user " +
-          user.id +
+          orglessUser.id +
           " to organization " +
           process.env.DEFAULT_ORG
       );
@@ -1280,13 +1192,188 @@ export async function fixOrgless() {
   } // if
 } // function
 
-export async function clearOldJobs(delay) {
+export async function clearOldJobs(event) {
   // to clear out old stuck jobs
-  const twoHoursAgo = new Date(new Date() - 1000 * 60 * 60 * 2);
-  delay = delay || twoHoursAgo;
+  const sixHoursAgo = new Date(new Date() - 1000 * 60 * 60 * 6);
+  const delay = (event && event.oldJobPast) || sixHoursAgo;
   return await r
     .knex("job_request")
     .where({ assigned: true })
     .where("updated_at", "<", delay)
     .delete();
+}
+
+export async function buyPhoneNumbers(job) {
+  try {
+    if (!job.organization_id) {
+      throw Error("organization_id is required");
+    }
+    const payload = JSON.parse(job.payload);
+    const { areaCode, limit, messagingServiceSid } = payload;
+    if (!areaCode || !limit) {
+      throw new Error("areaCode and limit are required");
+    }
+    const organization = await cacheableData.organization.load(
+      job.organization_id
+    );
+    const service = serviceMap[getConfig("DEFAULT_SERVICE", organization)];
+    const opts = {};
+    if (messagingServiceSid) {
+      opts.messagingServiceSid = messagingServiceSid;
+    }
+    const totalPurchased = await service.buyNumbersInAreaCode(
+      organization,
+      areaCode,
+      limit,
+      opts
+    );
+    log.info(`Bought ${totalPurchased} number(s)`, {
+      status: "COMPLETE",
+      areaCode,
+      limit,
+      totalPurchased,
+      organization_id: job.organization_id
+    });
+  } catch (err) {
+    log.error(`JOB ${job.id} FAILED: ${err.message}`, err);
+  } finally {
+    await defensivelyDeleteJob(job);
+  }
+}
+
+export async function deletePhoneNumbers(job) {
+  try {
+    if (!job.organization_id) {
+      throw Error("organization_id is required");
+    }
+    const { areaCode } = JSON.parse(job.payload);
+    if (!areaCode) {
+      throw new Error("areaCode is required");
+    }
+    const organization = await cacheableData.organization.load(
+      job.organization_id
+    );
+    const service = serviceMap[getConfig("DEFAULT_SERVICE", organization)];
+    const totalDeleted = await service.deleteNumbersInAreaCode(
+      organization,
+      areaCode
+    );
+    log.info(`Deleted ${totalDeleted} number(s)`, {
+      status: "COMPLETE",
+      areaCode,
+      totalDeleted,
+      organization_id: job.organization_id
+    });
+  } catch (err) {
+    log.error(`JOB ${job.id} FAILED: ${err.message}`, err);
+  } finally {
+    await defensivelyDeleteJob(job);
+  }
+}
+
+// Prepares a messaging service with owned number for the campaign
+async function prepareTwilioCampaign(campaign, organization, trx) {
+  const ts = Math.floor(new Date() / 1000);
+  const baseUrl = getConfig("BASE_URL", organization);
+  const friendlyName = `Campaign ${campaign.id}: ${campaign.organization_id}-${ts} [${baseUrl}]`;
+  const messagingService = await twilio.createMessagingService(
+    organization,
+    friendlyName
+  );
+  const msgSrvSid = messagingService.sid;
+  if (!msgSrvSid) {
+    throw new Error("Failed to create messaging service!");
+  }
+  const phoneSids = (
+    await trx("owned_phone_number")
+      .select("service_id")
+      .where({
+        organization_id: campaign.organization_id,
+        service: "twilio",
+        allocated_to: "campaign",
+        allocated_to_id: campaign.id.toString()
+      })
+  ).map(row => row.service_id);
+  console.log(`Transferring ${phoneSids.length} numbers to ${msgSrvSid}`);
+  try {
+    await twilio.addNumbersToMessagingService(
+      organization,
+      phoneSids,
+      msgSrvSid
+    );
+  } catch (e) {
+    console.error("Failed to add numbers to messaging service", e);
+    await twilio.deleteMessagingService(organization, msgSrvSid);
+    throw new Error("Failed to add numbers to messaging service");
+  }
+  return msgSrvSid;
+}
+
+// Start a campaign when EXPERIMENTAL_CAMPAIGN_PHONE_NUMBERS is enabled
+// TODO: refactor this to share more code with the startCampaign mutation
+export async function startCampaignWithPhoneNumbers(job) {
+  if (!job.campaign_id) {
+    throw new Error("Missing job.campaign_id");
+  }
+  try {
+    let organization;
+    await r.knex.transaction(async trx => {
+      const campaign = await trx("campaign")
+        .where("id", job.campaign_id)
+        // PG only: lock this campaign while starting, making this job idempotent
+        .forUpdate()
+        .first();
+      if (campaign.is_started) {
+        throw new Error("Campaign already started");
+      }
+      organization = await trx("organization")
+        .where("id", campaign.organization_id)
+        .first();
+      const service = getConfig("DEFAULT_SERVICE", organization);
+
+      let messagingServiceSid;
+      if (service === "twilio") {
+        messagingServiceSid = await prepareTwilioCampaign(
+          campaign,
+          organization,
+          trx
+        );
+      } else if (service === "fakeservice") {
+        // simulate some latency
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        messagingServiceSid = "FAKEMESSAGINGSERVICE";
+      } else {
+        throw new Error(
+          `Campaign phone numbers are not supported for service ${service}`
+        );
+      }
+
+      await trx("campaign")
+        .where("id", campaign.id)
+        .update({
+          is_started: true,
+          use_own_messaging_service: true,
+          messageservice_sid: messagingServiceSid
+        });
+    });
+
+    await cacheableData.campaign.clear(job.campaign_id);
+    const reloadedCampaign = await cacheableData.campaign.load(job.campaign_id);
+
+    await sendUserNotification({
+      type: Notifications.CAMPAIGN_STARTED,
+      campaignId: job.campaign_id
+    });
+
+    // We are already in an background job process, so invoke the task directly rather than
+    // kicking it off through the dispatcher
+    await invokeTaskFunction(Tasks.CAMPAIGN_START_CACHE, {
+      organization,
+      campaign: reloadedCampaign
+    });
+  } catch (e) {
+    console.error(`Job ${job.id} failed: ${e.message}`, e);
+  } finally {
+    await defensivelyDeleteJob(job);
+  }
 }

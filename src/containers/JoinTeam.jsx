@@ -2,7 +2,6 @@ import PropTypes from "prop-types";
 import React from "react";
 import loadData from "./hoc/load-data";
 import gql from "graphql-tag";
-import wrapMutations from "./hoc/wrap-mutations";
 import { withRouter } from "react-router";
 import { StyleSheet, css } from "aphrodite";
 import theme from "../styles/theme";
@@ -21,23 +20,20 @@ class JoinTeam extends React.Component {
     let organization = null;
     let campaign = null;
     try {
-      organization = await this.props.mutations.joinOrganization();
-    } catch (ex) {
+      organization = await this.props.mutations.joinOrganization(
+        this.props.location.search
+      );
+    } catch (err) {
+      console.log("error joining", err);
+      const texterMessage = (err &&
+        err.message &&
+        err.message.match(/(Sorry,.+)$/)) || [
+        0,
+        "Something went wrong trying to join this organization. Please contact your administrator."
+      ];
       this.setState({
-        errors:
-          "Something went wrong trying to join this organization. Please contact your administrator."
+        errors: texterMessage[1]
       });
-    }
-
-    if (this.props.params.campaignId) {
-      try {
-        campaign = await this.props.mutations.assignUserToCampaign();
-      } catch (ex) {
-        this.setState({
-          errors:
-            "Something went wrong trying to join this campaign. Please contact your administrator."
-        });
-      }
     }
 
     if (organization) {
@@ -59,41 +55,33 @@ class JoinTeam extends React.Component {
 
 JoinTeam.propTypes = {
   mutations: PropTypes.object,
-  router: PropTypes.object
+  router: PropTypes.object,
+  location: PropTypes.object
 };
 
-const mapMutationsToProps = ({ ownProps }) => ({
-  joinOrganization: () => ({
+const mutations = {
+  joinOrganization: ownProps => queryParams => ({
     mutation: gql`
-      mutation joinOrganization($organizationUuid: String!) {
-        joinOrganization(organizationUuid: $organizationUuid) {
-          id
-        }
-      }
-    `,
-    variables: { organizationUuid: ownProps.params.organizationUuid }
-  }),
-  assignUserToCampaign: () => ({
-    mutation: gql`
-      mutation assignUserToCampaign(
+      mutation joinOrganization(
         $organizationUuid: String!
-        $campaignId: String!
+        $campaignId: String
+        $queryParams: String
       ) {
-        assignUserToCampaign(
+        joinOrganization(
           organizationUuid: $organizationUuid
           campaignId: $campaignId
+          queryParams: $queryParams
         ) {
           id
         }
       }
     `,
     variables: {
+      organizationUuid: ownProps.params.organizationUuid,
       campaignId: ownProps.params.campaignId,
-      organizationUuid: ownProps.params.organizationUuid
+      queryParams: queryParams
     }
   })
-});
+};
 
-export default loadData(wrapMutations(withRouter(JoinTeam)), {
-  mapMutationsToProps
-});
+export default loadData({ mutations })(withRouter(JoinTeam));

@@ -2,9 +2,6 @@ import thinky from "./thinky";
 const type = thinky.type;
 import { requiredString, optionalString, timestamp } from "./custom-types";
 
-import Campaign from "./campaign";
-import Assignment from "./assignment";
-
 const CampaignContact = thinky.createModel(
   "campaign_contact",
   type
@@ -31,6 +28,10 @@ const CampaignContact = thinky.createModel(
           "UPDATING"
         ])
         .default("needsMessage"),
+      error_code: type
+        .integer()
+        .allowNull()
+        .default(null),
       is_opted_out: type.boolean().default(false),
       timezone_offset: type
         .string()
@@ -41,9 +42,9 @@ const CampaignContact = thinky.createModel(
   { noAutoCreation: true }
 );
 
-CampaignContact.ensureIndex("assignment_id");
-CampaignContact.ensureIndex("campaign_id");
+// for updating is_opted_out:
 CampaignContact.ensureIndex("cell");
+
 CampaignContact.ensureIndex("campaign_assignment", doc => [
   doc("campaign_id"),
   doc("assignment_id")

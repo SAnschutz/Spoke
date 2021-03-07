@@ -15,14 +15,19 @@ module.exports = {
       }
     }),
     JOBS_SYNC: "1",
+    TASKS_SYNC: "1",
     JOBS_SAME_PROCESS: "1",
     RETHINK_KNEX_NOREFS: "1", // avoids db race conditions
     DEFAULT_SERVICE: "fakeservice",
-    DST_REFERENCE_TIMEZONE: "America/New_York",
+    DST_REFERENCE_TIMEZONE: "US/Eastern",
     DATABASE_SETUP_TEARDOWN_TIMEOUT: 60000,
     PASSPORT_STRATEGY: "local",
     SESSION_SECRET: "it is JUST a test! -- it better be!",
-    TEST_ENVIRONMENT: "1"
+    TWILIO_ACCOUNT_SID: "", // purposefully blank
+    TWILIO_MESSAGE_SERVICE_SID: "TEST_MESSAGE_SID",
+    TEST_ENVIRONMENT: "1",
+    TEST_ENVIRONMENT_FAKE: "0",
+    TEST_ENVIRONMENT_FAKE2: "false"
   },
   moduleFileExtensions: ["js", "jsx"],
   transform: {
@@ -42,5 +47,8 @@ module.exports = {
     "!**/coverage/**"
   ],
   setupTestFrameworkScriptFile: "<rootDir>/__test__/setup.js",
-  testPathIgnorePatterns: ["<rootDir>/node_modules/", "<rootDir>/__test__/e2e/"]
+  testPathIgnorePatterns: [
+    "<rootDir>/node_modules/",
+    "<rootDir>/__test__/cypress/"
+  ]
 };
